@@ -59,6 +59,7 @@ for p in "${PKGS[@]}"; do
     # No stamp on a failed facade, so the next build retries it.
     if grep -q "FAILED" "build/pkg-$name.log"; then
         warn "$name: facade not precompiled (see build/pkg-$name.log)"
+        grep -v "^ *|\|^ *-->\|^\s*$" "build/pkg-$name.log" | head -15 | sed 's/^/      /' >&2
     else
         mkdir -p "$dir/build/$PLAT" && touch "$stamp"
     fi
