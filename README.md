@@ -157,6 +157,28 @@ d'installation et les DLL MinGW nécessaires. Un service ne voit pas le
 
 ## Installer
 
+### Avec le MSI (recommandé)
+
+Après `build.cmd`, lancer **msi.cmd** : il produit
+`dist-msi\Logonoff-<version>.msi`. Un double-clic l'installe (droits
+administrateur requis). Ce que fait le MSI :
+
+- installe le programme dans `C:\Program Files\Logonoff` ;
+- installe et démarre le service, avec redémarrage automatique en cas
+  de plantage ;
+- remplace un ancien service « Logonoff », qu'il vienne de la version C#
+  ou de `install.cmd` ;
+- crée le raccourci du menu Démarrer.
+
+Pour mettre à jour, il suffit d'installer un MSI plus récent : il
+remplace l'ancien. La désinstallation passe par Paramètres → Applications.
+Les données dans `C:\ProgramData\Logonoff` ne sont jamais touchées.
+
+Pour un déploiement silencieux par le service informatique :
+`msiexec /i Logonoff-<version>.msi /qn` (désinstallation : `/x`).
+
+### À la main
+
 Depuis `dist\`, faire un clic droit sur **install.cmd** puis « Exécuter en
 tant qu'administrateur ». Le script :
 

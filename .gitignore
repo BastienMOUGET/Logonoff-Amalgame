@@ -1,6 +1,7 @@
 # build outputs
 /build/
 /dist/
+/dist-msi/
 # precompiled package objects (per platform, rebuilt by build.sh)
 /packages/**/build/
 
