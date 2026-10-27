@@ -1,0 +1,661 @@
+namespace Logonoff
+
+import Amalgame.Collections
+import Amalgame.Database.SQLite
+import Amalgame.Threading
+
+// ── Store ─────────────────────────────────────────────
+//
+// Every table, every query. One SQLite connection shared by the
+// capture thread and the HTTP thread, serialised by `Mu`: each public
+// method is one critical section, so check-then-write sequences
+// (open an interval only if none is open…) are atomic.
+//
+// Times are UTC epoch seconds. Local days are cut by the callers
+// (TimeCalc) — nothing here knows about time zones.
+//
+// Tables:
+//   users      — one row per Windows account (keyed by SID).
+//   events     — raw session / power events, never rewritten (audit).
+//   intervals  — presence periods derived from events; end_at NULL
+//                while open, last_seen bumped by the heartbeat so a
+//                crash can be closed at the last moment we knew.
+//                manual = 1 for rows created or edited by the user.
+//   projects   — per-user imputation codes.
+//   switches   — "from `at` on I work on project X" (project_id NULL
+//                = no project). Time per project = presence ∩ these.
+//   settings   — (scope, key) → value; scope "machine" or "user:<id>".
+//   notified   — markers so a notification fires once per day.
+//   allocations — per-day manual split of time between imputations;
+//                when a day has rows, they replace the computed split
+//                (report, export). project_id 0 = no project.
+//   breaks     — absences the user declared as not worked (lunch,
+//                personal). A declared lunch replaces the lunch-gap
+//                guess.
+//
+// intervals.activity: "poste" (at the computer, detected or typed),
+// "reunion", "deplacement", "autre", "urgence" — all count as work —
+// or "perso" (personal use of the computer: not counted). "urgence"
+// also overrides the "outside working hours = personal" rule.
+// intervals.note: free text (why, ticket number…).
+// switches.personal = 1: "personal mode" from `at` on — presence is
+// not counted until the next switch; read back as project id -1. A non-null
+// intervals.project_id pins the piece to that project, overriding the
+// switch timeline (a meeting for project X while "working on" Y).
+
+public class Store {
+    public Db:    AmalgameSQLite
+    public Mu:    AmalgameMutex
+    public Ready: bool
+    public Error: string
+
+    public Store() {
+        this.Mu    = Threading.MutexNew()
+        this.Ready = false
+        this.Error = ""
+    }
+
+    public static Store Open(path: string) {
+        let s = new Store()
+        s.Db = SQLite.Open(path)
+        if (!SQLite.IsOpen(s.Db)) {
+            s.Error = "cannot open " + path
+            return s
+        }
+        SQLite.Exec(s.Db, "PRAGMA journal_mode=WAL")
+        SQLite.Exec(s.Db, "PRAGMA busy_timeout=5000")
+        SQLite.Exec(s.Db, "PRAGMA synchronous=NORMAL")
+        SQLite.Exec(s.Db, "PRAGMA foreign_keys=ON")
+        s.createSchema()
+        s.Ready = true
+        return s
+    }
+
+    private void createSchema() {
+        SQLite.Exec(this.Db,
+            "CREATE TABLE IF NOT EXISTS users ("
+            + "id INTEGER PRIMARY KEY, sid TEXT NOT NULL UNIQUE, account TEXT NOT NULL, "
+            + "display TEXT NOT NULL DEFAULT '', created_at INTEGER NOT NULL)")
+        SQLite.Exec(this.Db,
+            "CREATE TABLE IF NOT EXISTS events ("
+            + "id INTEGER PRIMARY KEY, user_id INTEGER REFERENCES users(id), "
+            + "session_id INTEGER, kind TEXT NOT NULL, at INTEGER NOT NULL, "
+            + "location TEXT NOT NULL DEFAULT '', source TEXT NOT NULL DEFAULT 'scm')")
+        SQLite.Exec(this.Db, "CREATE INDEX IF NOT EXISTS ix_events_user_at ON events(user_id, at)")
+        SQLite.Exec(this.Db,
+            "CREATE TABLE IF NOT EXISTS intervals ("
+            + "id INTEGER PRIMARY KEY, user_id INTEGER NOT NULL REFERENCES users(id), "
+            + "start_at INTEGER NOT NULL, end_at INTEGER, last_seen INTEGER NOT NULL, "
+            + "start_reason TEXT NOT NULL DEFAULT '', end_reason TEXT NOT NULL DEFAULT '', "
+            + "location TEXT NOT NULL DEFAULT '', manual INTEGER NOT NULL DEFAULT 0)")
+        SQLite.Exec(this.Db, "CREATE INDEX IF NOT EXISTS ix_intervals_user_start ON intervals(user_id, start_at)")
+        // v0.2 columns. Idempotent: the ALTER fails harmlessly once applied.
+        SQLite.Exec(this.Db, "ALTER TABLE intervals ADD COLUMN activity TEXT NOT NULL DEFAULT 'poste'")
+        SQLite.Exec(this.Db, "ALTER TABLE intervals ADD COLUMN project_id INTEGER REFERENCES projects(id)")
+        SQLite.Exec(this.Db, "ALTER TABLE intervals ADD COLUMN note TEXT NOT NULL DEFAULT ''")
+        SQLite.Exec(this.Db,
+            "CREATE TABLE IF NOT EXISTS breaks ("
+            + "id INTEGER PRIMARY KEY, user_id INTEGER NOT NULL REFERENCES users(id), "
+            + "start_at INTEGER NOT NULL, end_at INTEGER NOT NULL, kind TEXT NOT NULL)")
+        SQLite.Exec(this.Db, "CREATE INDEX IF NOT EXISTS ix_breaks_user_start ON breaks(user_id, start_at)")
+        SQLite.Exec(this.Db,
+            "CREATE TABLE IF NOT EXISTS allocations ("
+            + "user_id INTEGER NOT NULL REFERENCES users(id), day TEXT NOT NULL, "
+            + "project_id INTEGER NOT NULL, seconds INTEGER NOT NULL, "
+            + "PRIMARY KEY(user_id, day, project_id))")
+        SQLite.Exec(this.Db,
+            "CREATE TABLE IF NOT EXISTS projects ("
+            + "id INTEGER PRIMARY KEY, user_id INTEGER NOT NULL REFERENCES users(id), "
+            + "code TEXT NOT NULL, label TEXT NOT NULL DEFAULT '', active INTEGER NOT NULL DEFAULT 1, "
+            + "UNIQUE(user_id, code))")
+        SQLite.Exec(this.Db,
+            "CREATE TABLE IF NOT EXISTS switches ("
+            + "id INTEGER PRIMARY KEY, user_id INTEGER NOT NULL REFERENCES users(id), "
+            + "project_id INTEGER REFERENCES projects(id), at INTEGER NOT NULL)")
+        SQLite.Exec(this.Db, "CREATE INDEX IF NOT EXISTS ix_switches_user_at ON switches(user_id, at)")
+        SQLite.Exec(this.Db, "ALTER TABLE switches ADD COLUMN personal INTEGER NOT NULL DEFAULT 0")
+        SQLite.Exec(this.Db,
+            "CREATE TABLE IF NOT EXISTS settings ("
+            + "scope TEXT NOT NULL, key TEXT NOT NULL, value TEXT NOT NULL, PRIMARY KEY(scope, key))")
+        SQLite.Exec(this.Db,
+            "CREATE TABLE IF NOT EXISTS notified ("
+            + "user_id INTEGER NOT NULL, day TEXT NOT NULL, kind TEXT NOT NULL, "
+            + "PRIMARY KEY(user_id, day, kind))")
+    }
+
+    // ── parameter lists (SQLite.ExecBind takes List<string>) ──
+
+    public static List<string> P1(a: string) {
+        let l = new List<string>()
+        l.Add(a)
+        return l
+    }
+
+    public static List<string> P2(a: string, b: string) {
+        let l: List<string> = Store.P1(a)
+        l.Add(b)
+        return l
+    }
+
+    public static List<string> P3(a: string, b: string, c: string) {
+        let l: List<string> = Store.P2(a, b)
+        l.Add(c)
+        return l
+    }
+
+    public static List<string> P4(a: string, b: string, c: string, d: string) {
+        let l: List<string> = Store.P3(a, b, c)
+        l.Add(d)
+        return l
+    }
+
+    public static List<string> P5(a: string, b: string, c: string, d: string, e: string) {
+        let l: List<string> = Store.P4(a, b, c, d)
+        l.Add(e)
+        return l
+    }
+
+    public static string I(n: int) {
+        return String_FromInt(n)
+    }
+
+    // Unlocked helpers — callers hold Mu.
+    private List<List<string>> q(sql: string, ps: List<string>) {
+        return SQLite.QueryBindAll(this.Db, sql, ps)
+    }
+
+    private bool x(sql: string, ps: List<string>) {
+        return SQLite.ExecBind(this.Db, sql, ps)
+    }
+
+    private int scalarInt(sql: string, ps: List<string>) {
+        let rows: List<List<string>> = this.q(sql, ps)
+        if (rows.Count() == 0) { return 0 }
+        let r: List<string> = rows.Get(0)
+        return String_ToInt(r.Get(0))
+    }
+
+    // ── users ─────────────────────────────────────────
+
+    // Id of the user with this SID, created on first sight. The
+    // account name is refreshed (renames keep the SID).
+    public int UpsertUser(sid: string, account: string, now: int) {
+        Threading.MutexLock(this.Mu)
+        this.x("INSERT INTO users (sid, account, display, created_at) VALUES (?, ?, ?, ?) "
+            + "ON CONFLICT(sid) DO UPDATE SET account = excluded.account",
+            Store.P4(sid, account, account, Store.I(now)))
+        let id: int = this.scalarInt("SELECT id FROM users WHERE sid = ?", Store.P1(sid))
+        Threading.MutexUnlock(this.Mu)
+        return id
+    }
+
+    // [id, sid, account, display] or empty.
+    public List<string> User(userId: int) {
+        Threading.MutexLock(this.Mu)
+        let rows: List<List<string>> = this.q(
+            "SELECT id, sid, account, display FROM users WHERE id = ?", Store.P1(Store.I(userId)))
+        Threading.MutexUnlock(this.Mu)
+        if (rows.Count() == 0) { return new List<string>() }
+        return rows.Get(0)
+    }
+
+    public void SetDisplayName(userId: int, display: string) {
+        Threading.MutexLock(this.Mu)
+        this.x("UPDATE users SET display = ? WHERE id = ?", Store.P2(display, Store.I(userId)))
+        Threading.MutexUnlock(this.Mu)
+    }
+
+    // [id, account, display] for every user.
+    public List<List<string>> Users() {
+        Threading.MutexLock(this.Mu)
+        let rows: List<List<string>> = this.q("SELECT id, account, display FROM users ORDER BY account", new List<string>())
+        Threading.MutexUnlock(this.Mu)
+        return rows
+    }
+
+    // ── events ────────────────────────────────────────
+
+    public void AddEvent(userId: int, sessionId: int, kind: string, at: int, location: string, source: string) {
+        Threading.MutexLock(this.Mu)
+        var uid: string = ""
+        if (userId > 0) { uid = Store.I(userId) }
+        let ps: List<string> = Store.P5(uid, Store.I(sessionId), kind, Store.I(at), location)
+        ps.Add(source)
+        this.x("INSERT INTO events (user_id, session_id, kind, at, location, source) "
+            + "VALUES (NULLIF(?, ''), ?, ?, ?, ?, ?)", ps)
+        Threading.MutexUnlock(this.Mu)
+    }
+
+    // [at, kind, session_id, location, source] of a user's events in [from, to).
+    public List<List<string>> Events(userId: int, from: int, to: int) {
+        Threading.MutexLock(this.Mu)
+        let rows: List<List<string>> = this.q(
+            "SELECT at, kind, session_id, location, source FROM events "
+            + "WHERE user_id = ? AND at >= ? AND at < ? ORDER BY at, id",
+            Store.P3(Store.I(userId), Store.I(from), Store.I(to)))
+        Threading.MutexUnlock(this.Mu)
+        return rows
+    }
+
+    // ── intervals ─────────────────────────────────────
+
+    // Open a presence interval at `at` unless one is already open.
+    // True if a new interval was opened.
+    public bool OpenInterval(userId: int, at: int, reason: string, location: string) {
+        Threading.MutexLock(this.Mu)
+        let open: int = this.scalarInt(
+            "SELECT COUNT(*) FROM intervals WHERE user_id = ? AND end_at IS NULL", Store.P1(Store.I(userId)))
+        var opened: bool = false
+        if (open == 0) {
+            opened = this.x("INSERT INTO intervals (user_id, start_at, last_seen, start_reason, location) "
+                + "VALUES (?, ?, ?, ?, ?)",
+                Store.P5(Store.I(userId), Store.I(at), Store.I(at), reason, location))
+        }
+        Threading.MutexUnlock(this.Mu)
+        return opened
+    }
+
+    // Close the user's open interval at `at` (never before its
+    // start). True if one was closed.
+    public bool CloseInterval(userId: int, at: int, reason: string) {
+        Threading.MutexLock(this.Mu)
+        this.x("UPDATE intervals SET end_at = MAX(start_at, CAST(? AS INTEGER)), "
+            + "last_seen = MAX(last_seen, CAST(? AS INTEGER)), end_reason = ? "
+            + "WHERE user_id = ? AND end_at IS NULL",
+            Store.P4(Store.I(at), Store.I(at), reason, Store.I(userId)))
+        let n: int = SQLite.Changes(this.Db)
+        Threading.MutexUnlock(this.Mu)
+        return n > 0
+    }
+
+    // Close every open interval (suspend, shutdown, service stop).
+    public int CloseAllOpen(at: int, reason: string) {
+        Threading.MutexLock(this.Mu)
+        this.x("UPDATE intervals SET end_at = MAX(start_at, CAST(? AS INTEGER)), "
+            + "last_seen = MAX(last_seen, CAST(? AS INTEGER)), end_reason = ? WHERE end_at IS NULL",
+            Store.P3(Store.I(at), Store.I(at), reason))
+        let n: int = SQLite.Changes(this.Db)
+        Threading.MutexUnlock(this.Mu)
+        return n
+    }
+
+    // Startup recovery: anything still open was cut by a crash or a
+    // power loss — close it at the last heartbeat we recorded.
+    public int CloseStale(reason: string) {
+        Threading.MutexLock(this.Mu)
+        this.x("UPDATE intervals SET end_at = last_seen, end_reason = ? WHERE end_at IS NULL", Store.P1(reason))
+        let n: int = SQLite.Changes(this.Db)
+        Threading.MutexUnlock(this.Mu)
+        return n
+    }
+
+    // Heartbeat: the user is still present at `at`.
+    public void Touch(userId: int, at: int) {
+        Threading.MutexLock(this.Mu)
+        this.x("UPDATE intervals SET last_seen = ? WHERE user_id = ? AND end_at IS NULL",
+            Store.P2(Store.I(at), Store.I(userId)))
+        Threading.MutexUnlock(this.Mu)
+    }
+
+    // Users with an open interval.
+    public List<int> OpenUsers() {
+        Threading.MutexLock(this.Mu)
+        let rows: List<List<string>> = this.q("SELECT DISTINCT user_id FROM intervals WHERE end_at IS NULL", new List<string>())
+        Threading.MutexUnlock(this.Mu)
+        let out = new List<int>()
+        for i in 0..rows.Count() {
+            let r: List<string> = rows.Get(i)
+            out.Add(String_ToInt(r.Get(0)))
+        }
+        return out
+    }
+
+    public bool IsOpen(userId: int) {
+        Threading.MutexLock(this.Mu)
+        let n: int = this.scalarInt(
+            "SELECT COUNT(*) FROM intervals WHERE user_id = ? AND end_at IS NULL", Store.P1(Store.I(userId)))
+        Threading.MutexUnlock(this.Mu)
+        return n > 0
+    }
+
+    // [id, start_at, end_at ("" if open), start_reason, end_reason,
+    // location, manual, activity, project_id ("" = by switches), note] of the
+    // user's intervals overlapping [from, to).
+    public List<List<string>> Intervals(userId: int, from: int, to: int) {
+        Threading.MutexLock(this.Mu)
+        let rows: List<List<string>> = this.q(
+            "SELECT id, start_at, end_at, start_reason, end_reason, location, manual, activity, project_id, note FROM intervals "
+            + "WHERE user_id = ? AND start_at < ? AND (end_at IS NULL OR end_at > ?) ORDER BY start_at, id",
+            Store.P3(Store.I(userId), Store.I(to), Store.I(from)))
+        Threading.MutexUnlock(this.Mu)
+        return rows
+    }
+
+    // Typed interval: `activity` poste / reunion / deplacement / autre,
+    // `projectId` 0 = follow the switch timeline.
+    public bool AddManualInterval(userId: int, start: int, end: int, activity: string, projectId: int) {
+        Threading.MutexLock(this.Mu)
+        var pid: string = ""
+        if (projectId > 0) { pid = Store.I(projectId) }
+        let ps: List<string> = Store.P5(Store.I(userId), Store.I(start), Store.I(end), Store.I(end), activity)
+        ps.Add(pid)
+        let ok: bool = this.x("INSERT INTO intervals (user_id, start_at, end_at, last_seen, start_reason, end_reason, manual, activity, project_id) "
+            + "VALUES (?, ?, ?, ?, 'manual', 'manual', 1, ?, NULLIF(?, ''))", ps)
+        Threading.MutexUnlock(this.Mu)
+        return ok
+    }
+
+    // End of the user's latest closed interval ending at or before
+    // `at`, 0 if none.
+    public int LastEndBefore(userId: int, at: int) {
+        Threading.MutexLock(this.Mu)
+        let v: int = this.scalarInt(
+            "SELECT IFNULL(MAX(end_at), 0) FROM intervals WHERE user_id = ? AND end_at IS NOT NULL AND end_at <= ?",
+            Store.P2(Store.I(userId), Store.I(at)))
+        Threading.MutexUnlock(this.Mu)
+        return v
+    }
+
+    // ── declared breaks ───────────────────────────────
+
+    public bool AddBreak(userId: int, start: int, end: int, kind: string) {
+        Threading.MutexLock(this.Mu)
+        let ok: bool = this.x("INSERT INTO breaks (user_id, start_at, end_at, kind) VALUES (?, ?, ?, ?)",
+            Store.P4(Store.I(userId), Store.I(start), Store.I(end), kind))
+        Threading.MutexUnlock(this.Mu)
+        return ok
+    }
+
+    // [id, start_at, end_at, kind] overlapping [from, to).
+    public List<List<string>> Breaks(userId: int, from: int, to: int) {
+        Threading.MutexLock(this.Mu)
+        let rows: List<List<string>> = this.q(
+            "SELECT id, start_at, end_at, kind FROM breaks WHERE user_id = ? AND start_at < ? AND end_at > ? ORDER BY start_at, id",
+            Store.P3(Store.I(userId), Store.I(to), Store.I(from)))
+        Threading.MutexUnlock(this.Mu)
+        return rows
+    }
+
+    public bool DeleteBreak(userId: int, id: int) {
+        Threading.MutexLock(this.Mu)
+        this.x("DELETE FROM breaks WHERE id = ? AND user_id = ?", Store.P2(Store.I(id), Store.I(userId)))
+        let n: int = SQLite.Changes(this.Db)
+        Threading.MutexUnlock(this.Mu)
+        return n > 0
+    }
+
+    // Edit an interval the user owns. `end` 0 keeps it open (only
+    // allowed if it is the open one).
+    public bool UpdateInterval(userId: int, id: int, start: int, end: int) {
+        Threading.MutexLock(this.Mu)
+        var endS: string = ""
+        if (end > 0) { endS = Store.I(end) }
+        this.x("UPDATE intervals SET start_at = ?, end_at = CASE WHEN ? = '' THEN end_at ELSE CAST(? AS INTEGER) END, "
+            + "manual = 1 WHERE id = ? AND user_id = ?",
+            Store.P5(Store.I(start), endS, endS, Store.I(id), Store.I(userId)))
+        let n: int = SQLite.Changes(this.Db)
+        Threading.MutexUnlock(this.Mu)
+        return n > 0
+    }
+
+    // Cut an interval at `at` (strictly inside it): the first part ends
+    // at `at`, a copy carrying the same tags covers the rest — and stays
+    // open if the original was. True on success.
+    public bool SplitInterval(userId: int, id: int, at: int) {
+        Threading.MutexLock(this.Mu)
+        let ok0: int = this.scalarInt(
+            "SELECT COUNT(*) FROM intervals WHERE id = ? AND user_id = ? AND start_at < ? "
+            + "AND (end_at IS NULL OR end_at > ?)",
+            Store.P4(Store.I(id), Store.I(userId), Store.I(at), Store.I(at)))
+        var ok: bool = ok0 > 0
+        if (ok) {
+            SQLite.Begin(this.Db)
+            ok = this.x("INSERT INTO intervals (user_id, start_at, end_at, last_seen, start_reason, end_reason, location, manual, activity, project_id) "
+                + "SELECT user_id, ?, end_at, MAX(last_seen, ?), 'split', end_reason, location, 1, activity, project_id "
+                + "FROM intervals WHERE id = ? AND user_id = ?",
+                Store.P4(Store.I(at), Store.I(at), Store.I(id), Store.I(userId)))
+            if (ok) {
+                ok = this.x("UPDATE intervals SET end_at = ?, end_reason = 'split', manual = 1 WHERE id = ? AND user_id = ?",
+                    Store.P3(Store.I(at), Store.I(id), Store.I(userId)))
+            }
+            if (ok) { SQLite.Commit(this.Db) } else { SQLite.Rollback(this.Db) }
+        }
+        Threading.MutexUnlock(this.Mu)
+        return ok
+    }
+
+    // Merge intervals into one spanning [start, end) (`end` 0 = still
+    // open). `keepId` is rewritten, the other `dropIds` are deleted, and
+    // so is every other interval of the user lying entirely inside the
+    // span (it would only duplicate time). One transaction.
+    public bool MergeIntervals(userId: int, keepId: int, dropIds: List<int>, start: int, end: int,
+                               activity: string, projectId: int, note: string) {
+        Threading.MutexLock(this.Mu)
+        SQLite.Begin(this.Db)
+        var pid: string = ""
+        if (projectId > 0) { pid = Store.I(projectId) }
+        var endS: string = ""
+        if (end > 0) { endS = Store.I(end) }
+        let ps: List<string> = Store.P5(Store.I(start), endS, endS, activity, pid)
+        ps.Add(note)
+        ps.Add(Store.I(keepId))
+        ps.Add(Store.I(userId))
+        var ok: bool = this.x("UPDATE intervals SET start_at = ?, end_at = NULLIF(?, ''), "
+            + "last_seen = MAX(last_seen, IFNULL(NULLIF(?, ''), last_seen)), activity = ?, "
+            + "project_id = NULLIF(?, ''), note = ?, manual = 1, end_reason = CASE WHEN end_at IS NULL THEN end_reason ELSE 'fusion' END "
+            + "WHERE id = ? AND user_id = ?", ps)
+        for i in 0..dropIds.Count() {
+            if (ok) {
+                ok = this.x("DELETE FROM intervals WHERE id = ? AND user_id = ?", Store.P2(Store.I(dropIds.Get(i)), Store.I(userId)))
+            }
+        }
+        if (ok && end > 0) {
+            ok = this.x("DELETE FROM intervals WHERE user_id = ? AND id <> ? AND start_at >= ? AND end_at IS NOT NULL AND end_at <= ?",
+                Store.P4(Store.I(userId), Store.I(keepId), Store.I(start), Store.I(end)))
+        }
+        if (ok) { SQLite.Commit(this.Db) } else { SQLite.Rollback(this.Db) }
+        Threading.MutexUnlock(this.Mu)
+        return ok
+    }
+
+    // Re-tag an interval: activity and pinned project (0 = follow the
+    // switch timeline).
+    public bool TagInterval(userId: int, id: int, activity: string, projectId: int, note: string) {
+        Threading.MutexLock(this.Mu)
+        var pid: string = ""
+        if (projectId > 0) { pid = Store.I(projectId) }
+        this.x("UPDATE intervals SET activity = ?, project_id = NULLIF(?, ''), note = ? WHERE id = ? AND user_id = ?",
+            Store.P5(activity, pid, note, Store.I(id), Store.I(userId)))
+        let n: int = SQLite.Changes(this.Db)
+        Threading.MutexUnlock(this.Mu)
+        return n > 0
+    }
+
+    // ── manual allocations ────────────────────────────
+
+    // [project_id, seconds] of a day's manual split (empty = automatic).
+    public List<List<string>> Allocations(userId: int, day: string) {
+        Threading.MutexLock(this.Mu)
+        let rows: List<List<string>> = this.q(
+            "SELECT project_id, seconds FROM allocations WHERE user_id = ? AND day = ? ORDER BY seconds DESC",
+            Store.P2(Store.I(userId), day))
+        Threading.MutexUnlock(this.Mu)
+        return rows
+    }
+
+    // Replace a day's split atomically. Empty lists = back to automatic.
+    public bool SetAllocations(userId: int, day: string, projectIds: List<int>, seconds: List<int>) {
+        Threading.MutexLock(this.Mu)
+        SQLite.Begin(this.Db)
+        var ok: bool = this.x("DELETE FROM allocations WHERE user_id = ? AND day = ?", Store.P2(Store.I(userId), day))
+        for i in 0..projectIds.Count() {
+            if (ok && seconds.Get(i) > 0) {
+                ok = this.x("INSERT INTO allocations (user_id, day, project_id, seconds) VALUES (?, ?, ?, ?)",
+                    Store.P4(Store.I(userId), day, Store.I(projectIds.Get(i)), Store.I(seconds.Get(i))))
+            }
+        }
+        if (ok) { SQLite.Commit(this.Db) } else { SQLite.Rollback(this.Db) }
+        Threading.MutexUnlock(this.Mu)
+        return ok
+    }
+
+    public bool DeleteInterval(userId: int, id: int) {
+        Threading.MutexLock(this.Mu)
+        this.x("DELETE FROM intervals WHERE id = ? AND user_id = ?", Store.P2(Store.I(id), Store.I(userId)))
+        let n: int = SQLite.Changes(this.Db)
+        Threading.MutexUnlock(this.Mu)
+        return n > 0
+    }
+
+    // ── projects ──────────────────────────────────────
+
+    // [id, code, label, active] ordered by code.
+    public List<List<string>> Projects(userId: int, includeInactive: bool) {
+        Threading.MutexLock(this.Mu)
+        var sql: string = "SELECT id, code, label, active FROM projects WHERE user_id = ?"
+        if (!includeInactive) { sql = sql + " AND active = 1" }
+        let rows: List<List<string>> = this.q(sql + " ORDER BY code", Store.P1(Store.I(userId)))
+        Threading.MutexUnlock(this.Mu)
+        return rows
+    }
+
+    // New project id, or 0 (duplicate code / error).
+    public int AddProject(userId: int, code: string, label: string) {
+        Threading.MutexLock(this.Mu)
+        let ok: bool = this.x("INSERT INTO projects (user_id, code, label) VALUES (?, ?, ?)",
+            Store.P3(Store.I(userId), code, label))
+        var id: int = 0
+        if (ok) { id = SQLite.LastInsertId(this.Db) }
+        Threading.MutexUnlock(this.Mu)
+        return id
+    }
+
+    public bool UpdateProject(userId: int, id: int, code: string, label: string, active: bool) {
+        Threading.MutexLock(this.Mu)
+        var a: string = "0"
+        if (active) { a = "1" }
+        this.x("UPDATE projects SET code = ?, label = ?, active = ? WHERE id = ? AND user_id = ?",
+            Store.P5(code, label, a, Store.I(id), Store.I(userId)))
+        let n: int = SQLite.Changes(this.Db)
+        Threading.MutexUnlock(this.Mu)
+        return n > 0
+    }
+
+    public bool OwnsProject(userId: int, id: int) {
+        Threading.MutexLock(this.Mu)
+        let n: int = this.scalarInt("SELECT COUNT(*) FROM projects WHERE id = ? AND user_id = ?",
+            Store.P2(Store.I(id), Store.I(userId)))
+        Threading.MutexUnlock(this.Mu)
+        return n > 0
+    }
+
+    // ── project switches ──────────────────────────────
+
+    // `projectId` 0 = "no project from now on", -1 = personal mode.
+    public bool AddSwitch(userId: int, projectId: int, at: int) {
+        Threading.MutexLock(this.Mu)
+        var pid: string = ""
+        if (projectId > 0) { pid = Store.I(projectId) }
+        var personal: string = "0"
+        if (projectId < 0) { personal = "1" }
+        let ok: bool = this.x("INSERT INTO switches (user_id, project_id, at, personal) VALUES (?, NULLIF(?, ''), ?, ?)",
+            Store.P4(Store.I(userId), pid, Store.I(at), personal))
+        Threading.MutexUnlock(this.Mu)
+        return ok
+    }
+
+    // [id, project_id ("" = none), at] of the switches in [from, to),
+    // preceded by the last switch before `from` (the project in force
+    // when the range starts), oldest first.
+    public List<List<string>> Switches(userId: int, from: int, to: int) {
+        Threading.MutexLock(this.Mu)
+        let before: List<List<string>> = this.q(
+            "SELECT id, CASE WHEN personal = 1 THEN -1 ELSE project_id END, at FROM switches WHERE user_id = ? AND at < ? ORDER BY at DESC, id DESC LIMIT 1",
+            Store.P2(Store.I(userId), Store.I(from)))
+        let inside: List<List<string>> = this.q(
+            "SELECT id, CASE WHEN personal = 1 THEN -1 ELSE project_id END, at FROM switches WHERE user_id = ? AND at >= ? AND at < ? ORDER BY at, id",
+            Store.P3(Store.I(userId), Store.I(from), Store.I(to)))
+        Threading.MutexUnlock(this.Mu)
+        let out = new List<List<string>>()
+        for i in 0..before.Count() { out.Add(before.Get(i)) }
+        for j in 0..inside.Count() { out.Add(inside.Get(j)) }
+        return out
+    }
+
+    public bool UpdateSwitch(userId: int, id: int, projectId: int, at: int) {
+        Threading.MutexLock(this.Mu)
+        var pid: string = ""
+        if (projectId > 0) { pid = Store.I(projectId) }
+        var personal: string = "0"
+        if (projectId < 0) { personal = "1" }
+        this.x("UPDATE switches SET project_id = NULLIF(?, ''), at = ?, personal = ? WHERE id = ? AND user_id = ?",
+            Store.P5(pid, Store.I(at), personal, Store.I(id), Store.I(userId)))
+        let n: int = SQLite.Changes(this.Db)
+        Threading.MutexUnlock(this.Mu)
+        return n > 0
+    }
+
+    public bool DeleteSwitch(userId: int, id: int) {
+        Threading.MutexLock(this.Mu)
+        this.x("DELETE FROM switches WHERE id = ? AND user_id = ?", Store.P2(Store.I(id), Store.I(userId)))
+        let n: int = SQLite.Changes(this.Db)
+        Threading.MutexUnlock(this.Mu)
+        return n > 0
+    }
+
+    // Project in force at `at`: id, 0 for none, -1 in personal mode.
+    public int ProjectAt(userId: int, at: int) {
+        Threading.MutexLock(this.Mu)
+        let id: int = this.scalarInt(
+            "SELECT CASE WHEN personal = 1 THEN -1 ELSE IFNULL(project_id, 0) END FROM switches WHERE user_id = ? AND at <= ? ORDER BY at DESC, id DESC LIMIT 1",
+            Store.P2(Store.I(userId), Store.I(at)))
+        Threading.MutexUnlock(this.Mu)
+        return id
+    }
+
+    // ── settings ──────────────────────────────────────
+
+    public string Setting(scope: string, key: string, fallback: string) {
+        Threading.MutexLock(this.Mu)
+        let rows: List<List<string>> = this.q("SELECT value FROM settings WHERE scope = ? AND key = ?", Store.P2(scope, key))
+        Threading.MutexUnlock(this.Mu)
+        if (rows.Count() == 0) { return fallback }
+        let r: List<string> = rows.Get(0)
+        return r.Get(0)
+    }
+
+    public void SetSetting(scope: string, key: string, value: string) {
+        Threading.MutexLock(this.Mu)
+        this.x("INSERT INTO settings (scope, key, value) VALUES (?, ?, ?) "
+            + "ON CONFLICT(scope, key) DO UPDATE SET value = excluded.value",
+            Store.P3(scope, key, value))
+        Threading.MutexUnlock(this.Mu)
+    }
+
+    public void DeleteSetting(scope: string, key: string) {
+        Threading.MutexLock(this.Mu)
+        this.x("DELETE FROM settings WHERE scope = ? AND key = ?", Store.P2(scope, key))
+        Threading.MutexUnlock(this.Mu)
+    }
+
+    // [key, value] of a scope.
+    public List<List<string>> Settings(scope: string) {
+        Threading.MutexLock(this.Mu)
+        let rows: List<List<string>> = this.q("SELECT key, value FROM settings WHERE scope = ? ORDER BY key", Store.P1(scope))
+        Threading.MutexUnlock(this.Mu)
+        return rows
+    }
+
+    // ── notifications ─────────────────────────────────
+
+    // Record that `kind` was notified to the user on `day`. True the
+    // first time only — the caller notifies when this returns true.
+    public bool MarkNotified(userId: int, day: string, kind: string) {
+        Threading.MutexLock(this.Mu)
+        this.x("INSERT OR IGNORE INTO notified (user_id, day, kind) VALUES (?, ?, ?)",
+            Store.P3(Store.I(userId), day, kind))
+        let n: int = SQLite.Changes(this.Db)
+        Threading.MutexUnlock(this.Mu)
+        return n > 0
+    }
+}

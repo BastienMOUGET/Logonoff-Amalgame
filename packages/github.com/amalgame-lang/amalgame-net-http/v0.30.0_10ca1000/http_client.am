@@ -1,0 +1,595 @@
+// amalgame-net-http — HttpRequestBuilder + ParsedUrl + HttpClient.
+//
+// Lives in its own file since v0.4.6 split (was in facade.am
+// v0.4.5 and earlier). No behavior change vs the previous combined
+// file — just locality.
+
+namespace Amalgame.Net.Http
+
+import Amalgame.Collections
+import Amalgame.String
+
+// v0.11.0: HTTPS client support. We pull amalgame-tls in via the
+// runtime header only (no AM-side import) — the Tls* classes
+// aren't reachable at AM resolution time when downstream tests
+// only `--external` net-http's own sources, so we call the C
+// primitives directly from @c blocks. The full TLS context setup
+// stays a single static-inline call away.
+@c {
+    #include "Amalgame_Tls.h"
+    #ifndef _WIN32
+      #include <netdb.h>   /* getaddrinfo; on Windows it comes from
+                            * winsock2/ws2tcpip via Amalgame_Tls.h */
+      #include <sys/socket.h>
+    #endif
+    #include <string.h>
+    #include <strings.h>   /* strncasecmp */
+    #include <stdio.h>     /* binary download → FILE* */
+    #include <stdlib.h>
+    #include <errno.h>
+
+    /* v0.27.0 — binary-safe download-to-file plumbing. Reading a binary
+     * response into an AM string truncates at the first NUL; instead we
+     * stream the response body straight to a FILE* on disk. */
+    static long amnh_rd(AmalgameTlsStream* st, int fd, char* buf, long n) {
+        if (st) return (long) Amalgame_Tls_TlsStream_ReadBytes(st, buf, (i64) n);
+        return (long) recv(fd, buf, (size_t) n, 0);
+    }
+    static long amnh_wr(AmalgameTlsStream* st, int fd, const char* buf, long n) {
+        if (st) return (long) Amalgame_Tls_TlsStream_WriteBytes(st, (char*) buf, (i64) n);
+        return (long) send(fd, buf, (size_t) n, 0);
+    }
+    /* One request over `fd` (TLS-wrapped when isTls). Returns 0 = body
+     * written to outPath, 1 = redirect (*loc set, caller re-requests),
+     * <0 = error (incl. -100-status when status != 200). Handles
+     * Content-Length and read-until-close; refuses chunked (-7) since the
+     * GitHub release CDN serves Content-Length. */
+    static int amnh_dl_once(int fd, int isTls, const char* host,
+                            const char* req, const char* outPath, char** loc) {
+        AmalgameTlsStream* st = NULL;
+        if (isTls) {
+            AmalgameTlsConfig* cfg = Amalgame_Tls_TlsConfig_Default();
+            cfg = Amalgame_Tls_TlsConfig_WithAlpn(cfg, "http/1.1");
+            AmalgameTlsContext* ctx = _amtls_new_ctx(cfg, false);
+            if (!ctx || !ctx->_ctx) return -2;
+            st = Amalgame_Tls_TlsStream_Wrap((i64) fd, ctx, false);
+            if (st && st->_ssl && host) SSL_set_tlsext_host_name((SSL*) st->_ssl, host);
+            if (!st || !Amalgame_Tls_TlsStream_Handshake(st)) {
+                if (st) Amalgame_Tls_TlsStream_Close(st);
+                return -3;
+            }
+        }
+        long rlen = (long) strlen(req);
+        if (amnh_wr(st, fd, req, rlen) < 0) {
+            if (st) Amalgame_Tls_TlsStream_Close(st);
+            return -4;
+        }
+        char hdr[16384]; int hl = 0; int hdrEnd = -1;
+        while (hl < (int) sizeof(hdr) - 1) {
+            long rn = amnh_rd(st, fd, hdr + hl, (long) sizeof(hdr) - 1 - hl);
+            if (rn <= 0) break;
+            hl += (int) rn; hdr[hl] = 0;
+            char* p = strstr(hdr, "\r\n\r\n");
+            if (p) { hdrEnd = (int)(p - hdr) + 4; break; }
+        }
+        if (hdrEnd < 0) { if (st) Amalgame_Tls_TlsStream_Close(st); return -5; }
+        int status = 0;
+        { char* sp = strchr(hdr, ' '); if (sp) status = atoi(sp + 1); }
+        char* locp = NULL; char* clp = NULL; int chunked = 0;
+        { char* line = hdr;
+          while (line && line < hdr + hdrEnd) {
+            char* eol = strstr(line, "\r\n");
+            if (!eol || eol >= hdr + hdrEnd) break;
+            int len = (int)(eol - line);
+            if (len > 9  && strncasecmp(line, "location:", 9) == 0) locp = line + 9;
+            else if (len > 15 && strncasecmp(line, "content-length:", 15) == 0) clp = line + 15;
+            else if (len > 18 && strncasecmp(line, "transfer-encoding:", 18) == 0) {
+                if (strstr(line, "chunked")) chunked = 1;
+            }
+            line = eol + 2;
+          }
+        }
+        if (status >= 300 && status < 400 && locp) {
+            while (*locp == ' ') locp++;
+            char* e = strstr(locp, "\r\n");
+            int ll = e ? (int)(e - locp) : (int) strlen(locp);
+            char* out = (char*) GC_MALLOC(ll + 1);
+            memcpy(out, locp, ll); out[ll] = 0; *loc = out;
+            if (st) Amalgame_Tls_TlsStream_Close(st);
+            return 1;
+        }
+        if (status != 200) { if (st) Amalgame_Tls_TlsStream_Close(st); return -100 - status; }
+        if (chunked) { if (st) Amalgame_Tls_TlsStream_Close(st); return -7; }
+        FILE* fp = fopen(outPath, "wb");
+        if (!fp) { if (st) Amalgame_Tls_TlsStream_Close(st); return -6; }
+        long bodyHave = hl - hdrEnd;
+        if (bodyHave > 0) fwrite(hdr + hdrEnd, 1, (size_t) bodyHave, fp);
+        long contentLen = clp ? atol(clp) : -1;
+        long written = bodyHave;
+        char dlbuf[65536];
+        while (1) {
+            if (contentLen >= 0 && written >= contentLen) break;
+            long want = (long) sizeof(dlbuf);
+            if (contentLen >= 0 && contentLen - written < want) want = contentLen - written;
+            long rn = amnh_rd(st, fd, dlbuf, want);
+            if (rn <= 0) break;
+            fwrite(dlbuf, 1, (size_t) rn, fp);
+            written += rn;
+        }
+        fclose(fp);
+        if (st) Amalgame_Tls_TlsStream_Close(st);
+        return 0;
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────
+// HttpClient — small surface for the common GET/POST cases.
+//
+// For complex requests (custom method, headers, body type) use
+// HttpRequestBuilder via `HttpClient.Request(...)`.
+// ─────────────────────────────────────────────────────────────────
+
+public class HttpRequestBuilder {
+    public Method:  string
+    public Url:     string
+    public Headers: Map<string, string>
+    public Body:    string
+
+    public HttpRequestBuilder() {
+        this.Method  = "GET"
+        this.Url     = ""
+        this.Headers = new Map<string, string>()
+        this.Body    = ""
+    }
+
+    public HttpRequestBuilder Header(string name, string value) {
+        this.Headers.Set(name, value)
+        return this
+    }
+    public HttpRequestBuilder BodyText(string s) {
+        this.Body = s
+        return this
+    }
+    public HttpRequestBuilder BodyJson(string jsonText) {
+        this.Body = jsonText
+        this.Headers.Set("Content-Type", "application/json")
+        return this
+    }
+    public HttpRequestBuilder BodyForm(Map<string, string> form) {
+        var s: string = ""
+        let keys: List<string> = form.Keys()
+        let kn: int = keys.Count()
+        for i in 0..kn {
+            if (i > 0) { s = s + "&" }
+            s = s + keys.Get(i) + "=" + form.Get(keys.Get(i))
+        }
+        this.Body = s
+        this.Headers.Set("Content-Type", "application/x-www-form-urlencoded")
+        return this
+    }
+
+    public HttpResponse Send() {
+        return HttpClient.Execute(this)
+    }
+}
+
+// Internal helper — parsed URL components. Defined before HttpClient
+// because amc's cgen requires struct field types to be complete at
+// the point of access (forward-decl is fine for typedefs only).
+public class ParsedUrl {
+    public Scheme: string    // "http" / "https"
+    public Host:   string
+    public Port:   int
+    public Path:   string
+
+    public ParsedUrl() {
+        this.Scheme = ""
+        this.Host   = ""
+        this.Port   = 0
+        this.Path   = "/"
+    }
+}
+
+public class HttpClient {
+    // Quick GET — returns the response (or a stub 0 if connect fails).
+    public static HttpResponse Get(string url) {
+        let b = new HttpRequestBuilder()
+        b.Method = "GET"
+        b.Url    = url
+        return HttpClient.Execute(b)
+    }
+    public static HttpResponse Post(string url, string body, string contentType) {
+        let b = new HttpRequestBuilder()
+        b.Method = "POST"
+        b.Url    = url
+        b.Body   = body
+        b.Headers.Set("Content-Type", contentType)
+        return HttpClient.Execute(b)
+    }
+    public static HttpRequestBuilder Request(string method, string url) {
+        let b = new HttpRequestBuilder()
+        b.Method = method
+        b.Url    = url
+        return b
+    }
+
+    // SSRF-guarded GET. Refuses (Status 0 stub) when the URL host resolves
+    // to a non-public address — loopback, RFC1918 private, link-local
+    // (incl. the 169.254.169.254 cloud-metadata endpoint), CGNAT, IPv6
+    // ULA/loopback/link-local, or IPv4-mapped equivalents. Opt-in:
+    // HttpClient.Get stays unguarded so trusted internal calls (OAuth /
+    // reCAPTCHA / ACME) keep working. Use GetGuarded for any URL that
+    // comes from user input.
+    //
+    // NOTE: the guard resolves the host, then Execute resolves again, so a
+    // determined attacker has a narrow DNS-rebinding TOCTOU window; this
+    // blocks the common SSRF cases but isn't a substitute for pinning the
+    // resolved IP through to connect().
+    public static HttpResponse GetGuarded(string url) {
+        let u: ParsedUrl = HttpClient.ParseUrl(url)
+        if (u == null || String_Length(u.Host) == 0) {
+            return HttpResponse.New().Status(0).Text("invalid url")
+        }
+        if (!HttpClient.HostIsPublic(u.Host)) {
+            return HttpResponse.New().Status(0).Text("blocked: non-public address (SSRF guard)")
+        }
+        return HttpClient.Get(url)
+    }
+
+    // True iff every address `host` resolves to is global-scope. Empty
+    // host or resolution failure → false (fail closed).
+    public static bool HostIsPublic(string host) {
+        var ok: bool = false
+        @c {
+            ok = 0;
+            const char* h = (const char*) host;
+            if (h && h[0]) {
+                struct addrinfo hints; memset(&hints, 0, sizeof(hints));
+                hints.ai_family = AF_UNSPEC; hints.ai_socktype = SOCK_STREAM;
+                struct addrinfo* res = NULL;
+                if (getaddrinfo(h, NULL, &hints, &res) == 0 && res) {
+                    int all_public = 1; int any = 0;
+                    for (struct addrinfo* ai = res; ai; ai = ai->ai_next) {
+                        any = 1;
+                        if (ai->ai_family == AF_INET) {
+                            struct sockaddr_in* s = (struct sockaddr_in*) ai->ai_addr;
+                            unsigned int a = ntohl(s->sin_addr.s_addr);
+                            unsigned int b0 = (a >> 24) & 0xff, b1 = (a >> 16) & 0xff;
+                            int priv = 0;
+                            if (b0 == 10) priv = 1;
+                            else if (b0 == 127) priv = 1;
+                            else if (b0 == 0) priv = 1;
+                            else if (b0 == 172 && b1 >= 16 && b1 <= 31) priv = 1;
+                            else if (b0 == 192 && b1 == 168) priv = 1;
+                            else if (b0 == 169 && b1 == 254) priv = 1;
+                            else if (b0 == 100 && b1 >= 64 && b1 <= 127) priv = 1;
+                            if (priv) all_public = 0;
+                        } else if (ai->ai_family == AF_INET6) {
+                            struct sockaddr_in6* s6 = (struct sockaddr_in6*) ai->ai_addr;
+                            unsigned char* a = s6->sin6_addr.s6_addr;
+                            int priv = 0;
+                            if (IN6_IS_ADDR_LOOPBACK(&s6->sin6_addr)) priv = 1;
+                            else if (IN6_IS_ADDR_LINKLOCAL(&s6->sin6_addr)) priv = 1;
+                            else if (IN6_IS_ADDR_UNSPECIFIED(&s6->sin6_addr)) priv = 1;
+                            else if ((a[0] & 0xfe) == 0xfc) priv = 1;
+                            else if (IN6_IS_ADDR_V4MAPPED(&s6->sin6_addr)) {
+                                unsigned int b0 = a[12], b1 = a[13];
+                                if (b0==10||b0==127||b0==0||(b0==172&&b1>=16&&b1<=31)
+                                    ||(b0==192&&b1==168)||(b0==169&&b1==254)
+                                    ||(b0==100&&b1>=64&&b1<=127)) priv = 1;
+                            }
+                            if (priv) all_public = 0;
+                        }
+                    }
+                    if (any && all_public) ok = 1;
+                }
+                if (res) freeaddrinfo(res);
+            }
+        }
+        return ok
+    }
+
+    // v0.27.0 — binary-safe download to a file on disk. Unlike Get (which
+    // reads the body into an AM string, truncating at the first NUL and
+    // capping at 1 MiB), this streams the response body straight to
+    // `path`, following up to 6 redirects (GitHub release URLs 302 to a
+    // CDN). Returns true on a 200 whose body was fully written. Pair with
+    // HttpResponse.File(path) to serve the cached file binary-safe.
+    //
+    //   if (HttpClient.DownloadToFile(assetUrl, cachePath)) { ... }
+    public static bool DownloadToFile(string url, string path) {
+        var cur: string = url
+        var hops: int = 0
+        while (hops < 6) {
+            let u: ParsedUrl = HttpClient.ParseUrl(cur)
+            if (u == null || String_Length(u.Host) == 0) { return false }
+            let isTls: bool = u.Scheme == "https"
+            var port: int = u.Port
+            if (port == 0) { if (isTls) { port = 443 } else { port = 80 } }
+            let crlf: string = String_FromByte(13) + "\n"
+            let req: string = "GET " + u.Path + " HTTP/1.1" + crlf
+                + "Host: " + u.Host + crlf
+                + "User-Agent: amalgame-net-http/0.27" + crlf
+                + "Accept: */*" + crlf
+                + "Connection: close" + crlf + crlf
+            let conn = TcpClient_Connect(u.Host, port)
+            if (!TcpClient_IsConnected(conn)) { return false }
+            var rc: int = -1
+            var location: string = ""
+            let reqC: string = req
+            let hostC: string = u.Host
+            let outC: string = path
+            var tlsFlag: int = 0
+            if (isTls) { tlsFlag = 1 }
+            @c {
+                int fd = conn ? conn->_fd : -1;
+                char* loc = 0;
+                rc = amnh_dl_once(fd, (int) tlsFlag, (const char*) hostC,
+                                  (const char*) reqC, (const char*) outC, &loc);
+                if (loc) location = loc;
+            }
+            TcpClient_Close(conn)
+            if (rc == 0) { return true }
+            if (rc == 1 && String_Length(location) > 0) {
+                cur = location
+                hops = hops + 1
+                continue
+            }
+            return false
+        }
+        return false
+    }
+
+    // Internal — parse URL, open socket (TCP or TLS), send request,
+    // read response. Plain HTTP only in v0.1 (HTTPS arrives once
+    // we wire amalgame-tls fully — same socket plumbing).
+    public static HttpResponse Execute(HttpRequestBuilder b) {
+        // Parse URL: <scheme>://<host>[:<port>]/<path>
+        let u: ParsedUrl = HttpClient.ParseUrl(b.Url)
+        if (u == null || String_Length(u.Host) == 0) {
+            return HttpResponse.New().Status(0).Text("invalid url")
+        }
+        let isTls: bool = u.Scheme == "https"
+        var port: int = u.Port
+        // NB: pas de ternaire `? :` ici — amc le compile à tort en
+        // `port = isTls` (le `? 443 : 80` est ignoré par la cgen), ce
+        // qui donnait port=0 sur http:// → connect(:0) qui PEND. if/else
+        // explicite. Bug amc à corriger séparément.
+        if (port == 0) {
+            if (isTls) { port = 443 } else { port = 80 }
+        }
+
+        // Build request bytes.
+        let crlf: string = String_FromByte(13) + "\n"
+        let cl: int = String_Length(b.Body)
+        var s: string = b.Method + " " + u.Path + " HTTP/1.1" + crlf
+        s = s + "Host: " + u.Host + crlf
+        s = s + "Content-Length: " + String_FromInt(cl) + crlf
+        s = s + "Connection: close" + crlf
+        let hk: List<string> = b.Headers.Keys()
+        let hn: int = hk.Count()
+        for i in 0..hn {
+            let k: string = hk.Get(i)
+            s = s + k + ": " + b.Headers.Get(k) + crlf
+        }
+        s = s + crlf + b.Body
+
+        // Connect (TCP — TLS upgrade follows for https://).
+        let conn = TcpClient_Connect(u.Host, port)
+        if (!TcpClient_IsConnected(conn)) {
+            return HttpResponse.New().Status(0).Text("connect failed")
+        }
+
+        if (isTls) {
+            // v0.11.0: HTTPS path. Everything below is inlined C
+            // against the amalgame-tls runtime header — the Tls*
+            // classes aren't reachable at AM resolution time when
+            // downstream tests only --external net-http's own
+            // sources, so we sidestep AM-level dispatch entirely.
+            // SNI is set per-connection (Github/Google would
+            // otherwise return the wrong cert). ALPN advertises
+            // "http/1.1" for parity with the plaintext path.
+            let host: string = u.Host
+            let req:  string = s
+            var status: int = 0
+            var rawResp: string = ""
+            @c {
+                int fd = conn ? conn->_fd : -1;
+                if (fd < 0) {
+                    status = -1;
+                } else {
+                    AmalgameTlsConfig* cfg =
+                        Amalgame_Tls_TlsConfig_Default();
+                    cfg = Amalgame_Tls_TlsConfig_WithAlpn(cfg, "http/1.1");
+                    AmalgameTlsContext* ctx = _amtls_new_ctx(cfg, false);
+                    if (!ctx || !ctx->_ctx) {
+                        status = -2;
+                    } else {
+                        AmalgameTlsStream* stream =
+                            Amalgame_Tls_TlsStream_Wrap((i64) fd, ctx, false);
+                        if (stream && stream->_ssl && host) {
+                            SSL_set_tlsext_host_name((SSL*) stream->_ssl, host);
+                        }
+                        if (!stream || !Amalgame_Tls_TlsStream_Handshake(stream)) {
+                            status = -3;
+                            if (stream) Amalgame_Tls_TlsStream_Close(stream);
+                        } else {
+                            /* Send request bytes via TLS. */
+                            size_t reqLen = req ? strlen(req) : 0;
+                            i64 wn = Amalgame_Tls_TlsStream_WriteBytes(
+                                stream, req ? req : "", (i64) reqLen);
+                            if (wn < 0) {
+                                status = -4;
+                                Amalgame_Tls_TlsStream_Close(stream);
+                            } else {
+                                /* Read up to 1 MiB into a growable
+                                 * buffer; loop until clean close
+                                 * (rn <= 0) or the 1 MiB safety ceiling.
+                                 *
+                                 * BUGFIX (v0.29.3): the old exit condition
+                                 * was `total >= cap`, which conflated "the
+                                 * CURRENT (still-growable) buffer happens to
+                                 * be exactly full" with "the response is
+                                 * complete". Whenever a read landed such
+                                 * that total exactly filled cap without a
+                                 * resize being triggered on that same
+                                 * iteration, the loop stopped even though
+                                 * the peer still had more bytes queued —
+                                 * silently truncating any response whose
+                                 * size happened to land on that boundary
+                                 * (~64 KiB, then ~128 KiB, etc). Verified in
+                                 * the wild: a 105 263-byte JSON response
+                                 * truncated to 65 115 bytes, breaking the
+                                 * caller's JSON parse with no error at the
+                                 * HTTP layer (status still 200). The resize
+                                 * block already grows `cap` up to the real
+                                 * 1 MiB ceiling as needed, so the only
+                                 * legitimate reason to stop reading (short
+                                 * of a clean close) is hitting that ceiling. */
+                                size_t cap = 65536;
+                                size_t total = 0;
+                                char* buf = (char*) GC_MALLOC(cap);
+                                char chunk[4096];
+                                size_t maxBody = 1048576;
+                                for (;;) {
+                                    i64 rn = Amalgame_Tls_TlsStream_ReadBytes(
+                                        stream, chunk, (i64) sizeof(chunk));
+                                    if (rn <= 0) break;
+                                    if (total + rn > cap) {
+                                        size_t newCap = cap * 2;
+                                        while (newCap < total + (size_t) rn) newCap *= 2;
+                                        if (newCap > maxBody) newCap = maxBody;
+                                        char* nbuf = (char*) GC_MALLOC(newCap);
+                                        memcpy(nbuf, buf, total);
+                                        buf = nbuf;
+                                        cap = newCap;
+                                    }
+                                    size_t can = (size_t) rn;
+                                    if (total + can > cap) can = cap - total;
+                                    memcpy(buf + total, chunk, can);
+                                    total += can;
+                                    if (total >= maxBody) break;
+                                }
+                                Amalgame_Tls_TlsStream_Close(stream);
+                                char* nul = (char*) GC_MALLOC(total + 1);
+                                if (total > 0) memcpy(nul, buf, total);
+                                nul[total] = 0;
+                                rawResp = nul;
+                                status = 0;
+                            }
+                        }
+                    }
+                }
+            }
+            TcpClient_Close(conn)
+            if (status != 0) {
+                return HttpResponse.New().Status(0).Text("tls error " + String_FromInt(status))
+            }
+            let resp: HttpResponse = HttpParser.ParseResponse(rawResp)
+            if (resp == null) {
+                return HttpResponse.New().Status(0).Text("invalid response")
+            }
+            return resp
+        }
+
+        // Plain TCP path (http://).
+        //
+        // BUGFIX (v0.29.5) — READ UNTIL THE RESPONSE IS ACTUALLY OVER.
+        //
+        // This used to be a single TcpClient_Receive(). That primitive
+        // is one recv(), and one recv() returns whatever has arrived at
+        // that instant — never a guarantee of a whole HTTP message. On
+        // loopback against a healthy server it failed roughly a third of
+        // the time, in two flavours that look nothing alike:
+        //
+        //   - a fragment of the status line  → ParseResponse fails,
+        //     the caller sees "HTTP 0" and blames the network;
+        //   - headers without the body       → a perfectly valid
+        //     "200 OK" with an empty body, which is far worse: the
+        //     caller believes it.
+        //
+        // The second one is why this mattered: a downstream agent read
+        // "200" and an empty desired-state, and kept routing on stale
+        // data with nothing anywhere saying so.
+        //
+        // The request carries `Connection: close`, so end-of-stream IS
+        // end-of-message; we read until the server closes. The HTTPS
+        // path already did this — only the plaintext path was naive.
+        TcpClient_Send(conn, s)
+        var raw: string = null
+        @c {
+            /* A read timeout, which the single-recv version also lacked.
+             * Without one, a server that accepts a connection and then
+             * says nothing hangs the caller for ever. Thirty seconds of
+             * SILENCE — not thirty seconds total — so a large slow body
+             * still comes through. */
+            #ifndef _WIN32
+            struct timeval _tv; _tv.tv_sec = 30; _tv.tv_usec = 0;
+            setsockopt(conn->_fd, SOL_SOCKET, SO_RCVTIMEO, &_tv, sizeof(_tv));
+            #endif
+            size_t _cap = 8192, _total = 0;
+            char* _buf = (char*) GC_MALLOC(_cap);
+            const size_t _MAXB = 1048576;   /* 1 MB cap, as before */
+            if (_buf) {
+                for (;;) {
+                    if (_total + 1 >= _cap) {
+                        size_t _n = _cap * 2;
+                        if (_n > _MAXB + 1) _n = _MAXB + 1;
+                        if (_n <= _cap) break;          /* ceiling reached */
+                        char* _nb = (char*) GC_MALLOC(_n);
+                        if (!_nb) break;
+                        memcpy(_nb, _buf, _total);
+                        _buf = _nb; _cap = _n;
+                    }
+                    ssize_t _r = recv(conn->_fd, _buf + _total, _cap - _total - 1, 0);
+                    if (_r < 0) {
+                        if (errno == EINTR) continue;
+                        break;                          /* timeout or error */
+                    }
+                    if (_r == 0) break;                 /* server closed: done */
+                    _total += (size_t) _r;
+                    if (_total >= _MAXB) break;
+                }
+                if (_total > 0) { _buf[_total] = 0; raw = _buf; }
+            }
+        }
+        TcpClient_Close(conn)
+        if (raw == null) {
+            return HttpResponse.New().Status(0).Text("read failed")
+        }
+        let resp: HttpResponse = HttpParser.ParseResponse(raw)
+        if (resp == null) {
+            return HttpResponse.New().Status(0).Text("invalid response")
+        }
+        return resp
+    }
+
+
+    private static ParsedUrl ParseUrl(string url) {
+        let p = new ParsedUrl()
+        let schemeSep: int = String_IndexOf(url, "://")
+        if (schemeSep < 0) { return null }
+        p.Scheme = String_Substring(url, 0, schemeSep)
+        let rest: string = String_Substring(url, schemeSep + 3, String_Length(url) - schemeSep - 3)
+        let slashIdx: int = String_IndexOf(rest, "/")
+        var hostPort: string = rest
+        if (slashIdx < 0) {
+            p.Path = "/"
+        } else {
+            hostPort = String_Substring(rest, 0, slashIdx)
+            p.Path   = String_Substring(rest, slashIdx, String_Length(rest) - slashIdx)
+        }
+        let colonIdx: int = String_IndexOf(hostPort, ":")
+        if (colonIdx < 0) {
+            p.Host = hostPort
+            p.Port = 0
+        } else {
+            p.Host = String_Substring(hostPort, 0, colonIdx)
+            p.Port = String_ToInt(
+                String_Substring(hostPort, colonIdx + 1,
+                                  String_Length(hostPort) - colonIdx - 1))
+        }
+        return p
+    }
+}
+

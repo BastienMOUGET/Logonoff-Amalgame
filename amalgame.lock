@@ -1,0 +1,49 @@
+# amalgame.lock — auto-generated, commit me
+
+[[package]]
+name = "crypto"
+git  = "github.com/amalgame-lang/amalgame-crypto"
+tag  = "v0.8.0"
+rev  = "1f908c0c"
+
+[[package]]
+name = "async"
+git  = "github.com/amalgame-lang/amalgame-async"
+tag  = "v0.4.1"
+rev  = "bbc91565"
+
+[[package]]
+name = "tls"
+git  = "github.com/amalgame-lang/amalgame-tls"
+tag  = "v0.3.6"
+rev  = "7a4c57c6"
+
+[[package]]
+name = "http"
+git  = "github.com/amalgame-lang/amalgame-net-http"
+tag  = "v0.30.0"
+rev  = "10ca1000"
+
+[[package]]
+name = "threading"
+git  = "github.com/amalgame-lang/amalgame-threading"
+tag  = "v0.1.0"
+rev  = "bfb5d018"
+
+[[package]]
+name = "sqlite"
+git  = "github.com/amalgame-lang/amalgame-database-sqlite"
+tag  = "v0.4.0"
+rev  = "5f186591"
+
+[[package]]
+name = "datetime"
+git  = "github.com/amalgame-lang/amalgame-datetime"
+tag  = "v0.3.0"
+rev  = "10ca1000"
+
+[[package]]
+name = "service"
+git  = "github.com/amalgame-lang/amalgame-service"
+tag  = "v0.3.0"
+rev  = "10ca1000"

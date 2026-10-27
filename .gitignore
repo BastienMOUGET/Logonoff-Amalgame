@@ -1,0 +1,8 @@
+# build outputs
+/build/
+/dist/
+# precompiled package objects (per platform, rebuilt by build.sh)
+/packages/**/build/
+
+# local data
+/data/

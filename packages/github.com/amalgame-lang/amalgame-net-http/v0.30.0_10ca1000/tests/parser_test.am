@@ -1,0 +1,235 @@
+// Unit tests for the HTTP/1.1 wire parser.
+//
+// These exercise HttpParser / HttpRequest / HttpResponse without
+// touching any sockets — fast, deterministic, OS-independent.
+
+namespace Tests
+
+import Amalgame.Collections
+import Amalgame.String
+import Amalgame.Net.Http
+
+public class Program {
+    public static void Main(string[] args) {
+        Console.WriteLine("amalgame-net-http — parser tests")
+
+        // AM string literals don't escape \r (only \n is recognized).
+        // Build CR LF explicitly from byte 13.
+        let cr: string = String_FromByte(13)
+        let crlf: string = cr + "\n"
+        let dcrlf: string = crlf + crlf
+
+        // ── HttpParser.ParseFull: basic GET ────────────────────────
+        let raw1: string = "GET /users/42?x=1&y=hello HTTP/1.1" + crlf + "Host: example.com" + crlf + "User-Agent: test" + dcrlf
+        let req1: HttpRequest = HttpParser.ParseFull(raw1)
+        if (req1 != null && req1.Method == "GET") {
+            Console.WriteLine("[PASS] parse GET method")
+        } else {
+            Console.WriteLine("[FAIL] parse GET method")
+        }
+        if (req1 != null && req1.Path == "/users/42") {
+            Console.WriteLine("[PASS] parse path")
+        } else {
+            Console.WriteLine("[FAIL] parse path got '" + req1.Path + "'")
+        }
+        if (req1 != null && req1.HttpVersion == "HTTP/1.1") {
+            Console.WriteLine("[PASS] parse version")
+        } else {
+            Console.WriteLine("[FAIL] parse version")
+        }
+        if (req1 != null && req1.Header("host") == "example.com") {
+            Console.WriteLine("[PASS] parse host header")
+        } else {
+            Console.WriteLine("[FAIL] parse host header")
+        }
+        if (req1 != null && req1.Header("USER-AGENT") == "test") {
+            Console.WriteLine("[PASS] case-insensitive header lookup")
+        } else {
+            Console.WriteLine("[FAIL] case-insensitive header lookup")
+        }
+        if (req1 != null && req1.Query.Get("x") == "1" && req1.Query.Get("y") == "hello") {
+            Console.WriteLine("[PASS] parse query string")
+        } else {
+            Console.WriteLine("[FAIL] parse query string")
+        }
+
+        // ── HttpParser.ParseFull: POST with body ───────────────────
+        let raw2: string = "POST /api/login HTTP/1.1" + crlf + "Content-Type: application/x-www-form-urlencoded" + crlf + "Content-Length: 25" + dcrlf + "user=alice&password=secret"
+        let req2: HttpRequest = HttpParser.ParseFull(raw2)
+        if (req2 != null && req2.Method == "POST") {
+            Console.WriteLine("[PASS] parse POST method")
+        } else {
+            Console.WriteLine("[FAIL] parse POST method")
+        }
+        if (req2 != null && req2.Body == "user=alice&password=secret") {
+            Console.WriteLine("[PASS] parse body")
+        } else {
+            Console.WriteLine("[FAIL] parse body got '" + req2.Body + "'")
+        }
+        let form: Map<string, string> = req2.Form()
+        if (form.Get("user") == "alice" && form.Get("password") == "secret") {
+            Console.WriteLine("[PASS] form parsing")
+        } else {
+            Console.WriteLine("[FAIL] form parsing")
+        }
+
+        // ── URL decoding ──────────────────────────────────────────
+        let decoded: string = HttpRequest.UrlDecode("hello%20world+from+amalgame")
+        if (decoded == "hello world from amalgame") {
+            Console.WriteLine("[PASS] urldecode")
+        } else {
+            Console.WriteLine("[FAIL] urldecode got '" + decoded + "'")
+        }
+
+        // ── Cookie parsing ────────────────────────────────────────
+        let raw3: string = "GET / HTTP/1.1" + crlf + "Cookie: sessionid=abc123; theme=dark; lang=fr" + dcrlf
+        let req3: HttpRequest = HttpParser.ParseFull(raw3)
+        if (req3.Cookie("sessionid") == "abc123" && req3.Cookie("theme") == "dark" && req3.Cookie("lang") == "fr") {
+            Console.WriteLine("[PASS] cookie parsing")
+        } else {
+            Console.WriteLine("[FAIL] cookie parsing")
+        }
+
+        // ── HttpResponse rendering ────────────────────────────────
+        let resp1: HttpResponse = HttpResponse.New()
+            .Status(200)
+            .Text("hello")
+        let rendered1: string = resp1.Render()
+        if (String_Contains(rendered1, "HTTP/1.1 200 OK") &&
+            String_Contains(rendered1, "Content-Length: 5") &&
+            String_Contains(rendered1, "Content-Type: text/plain") &&
+            String_EndsWith(rendered1, dcrlf + "hello")) {
+            Console.WriteLine("[PASS] response render text")
+        } else {
+            Console.WriteLine("[FAIL] response render text")
+        }
+
+        let resp2: HttpResponse = HttpResponse.New()
+            .Json("{\"ok\":true}")
+        let rendered2: string = resp2.Render()
+        if (String_Contains(rendered2, "Content-Type: application/json") &&
+            String_EndsWith(rendered2, "{\"ok\":true}")) {
+            Console.WriteLine("[PASS] response render json")
+        } else {
+            Console.WriteLine("[FAIL] response render json")
+        }
+
+        let resp3: HttpResponse = HttpResponse.New().Redirect("/login", false)
+        let rendered3: string = resp3.Render()
+        if (String_Contains(rendered3, "HTTP/1.1 302") &&
+            String_Contains(rendered3, "Location: /login")) {
+            Console.WriteLine("[PASS] response redirect")
+        } else {
+            Console.WriteLine("[FAIL] response redirect")
+            Console.WriteLine("  got: " + rendered3)
+        }
+
+        // ── Cookie serialization ──────────────────────────────────
+        let c = new Cookie()
+        c.Name      = "session"
+        c.Value     = "xyz789"
+        c.MaxAgeSec = 3600
+        c.Secure    = true
+        let cs: string = c.ToHeader()
+        if (String_Contains(cs, "session=xyz789") &&
+            String_Contains(cs, "Max-Age=3600") &&
+            String_Contains(cs, "HttpOnly") &&
+            String_Contains(cs, "Secure") &&
+            String_Contains(cs, "SameSite=Lax")) {
+            Console.WriteLine("[PASS] cookie serialization")
+        } else {
+            Console.WriteLine("[FAIL] cookie serialization got '" + cs + "'")
+        }
+
+        // ── Response parsing (client side) ────────────────────────
+        let respRaw: string = "HTTP/1.1 200 OK" + crlf + "Content-Type: text/plain" + crlf + "Content-Length: 5" + dcrlf + "hello"
+        let resp4: HttpResponse = HttpParser.ParseResponse(respRaw)
+        if (resp4 != null && resp4.StatusCode == 200 && resp4.BodyText == "hello") {
+            Console.WriteLine("[PASS] response parsing")
+        } else {
+            Console.WriteLine("[FAIL] response parsing")
+        }
+
+        // ── Chunked transfer-encoding (v0.13.2) ───────────────────
+        // Google's reCAPTCHA siteverify replies chunked; the raw body
+        // is "<hexsize>CRLF<data>CRLF…0CRLFCRLF" and must be de-chunked
+        // before Json.Parse sees it. Two chunks: 0xA ("0123456789") +
+        // 0x5 ("abcde") → "0123456789abcde".
+        let chunkedRaw: string = "HTTP/1.1 200 OK" + crlf
+            + "Content-Type: application/json" + crlf
+            + "Transfer-Encoding: chunked" + dcrlf
+            + "a" + crlf + "0123456789" + crlf
+            + "5" + crlf + "abcde" + crlf
+            + "0" + crlf + crlf
+        let respChunk: HttpResponse = HttpParser.ParseResponse(chunkedRaw)
+        if (respChunk != null && respChunk.BodyText == "0123456789abcde") {
+            Console.WriteLine("[PASS] chunked transfer-encoding decoded")
+        } else {
+            Console.WriteLine("[FAIL] chunked got '"
+                + respChunk.BodyText + "'")
+        }
+
+        // ── Malformed input ───────────────────────────────────────
+        let bad1: HttpRequest = HttpParser.ParseFull("garbage")
+        if (bad1 == null) {
+            Console.WriteLine("[PASS] reject malformed")
+        } else {
+            Console.WriteLine("[FAIL] reject malformed")
+        }
+
+        // ── CRLF injection guard (v0.4.2) ────────────────────────
+        // Header() drops values containing CR or LF. HeaderUnsafe
+        // bypasses the guard for trusted internal values.
+        let respGuard1: HttpResponse = HttpResponse.New()
+            .Header("X-Safe",    "hello")
+            .Header("X-Injected", "evil" + crlf + "Set-Cookie: pwn=1")
+            .Header("X-Also-Safe", "world")
+        if (respGuard1.Headers.Get("X-Safe") == "hello"
+            && !respGuard1.Headers.Has("X-Injected")
+            && respGuard1.Headers.Get("X-Also-Safe") == "world") {
+            Console.WriteLine("[PASS] CRLF guard drops injected header, keeps siblings")
+        } else {
+            Console.WriteLine("[FAIL] CRLF guard injected-header check failed")
+        }
+
+        // Pure CR is also blocked.
+        let respGuard2: HttpResponse = HttpResponse.New()
+            .Header("X-CR-Only", "hi" + cr + "Injected: 1")
+        if (!respGuard2.Headers.Has("X-CR-Only")) {
+            Console.WriteLine("[PASS] CRLF guard catches bare CR")
+        } else {
+            Console.WriteLine("[FAIL] CRLF guard missed bare CR")
+        }
+
+        // Pure LF is also blocked.
+        let respGuard3: HttpResponse = HttpResponse.New()
+            .Header("X-LF-Only", "hi" + "\n" + "Injected: 1")
+        if (!respGuard3.Headers.Has("X-LF-Only")) {
+            Console.WriteLine("[PASS] CRLF guard catches bare LF")
+        } else {
+            Console.WriteLine("[FAIL] CRLF guard missed bare LF")
+        }
+
+        // HeaderUnsafe bypasses the guard — caller takes responsibility.
+        let respUnsafe: HttpResponse = HttpResponse.New()
+            .HeaderUnsafe("X-Raw", "anything" + crlf + "even-this")
+        if (respUnsafe.Headers.Has("X-Raw")) {
+            Console.WriteLine("[PASS] HeaderUnsafe bypasses guard")
+        } else {
+            Console.WriteLine("[FAIL] HeaderUnsafe was guarded")
+        }
+
+        // v0.12.2: percent-decode (used to decode req.Path so non-ASCII
+        // / spaced URLs match static files + routes). UTF-8 multi-byte
+        // sequences decode byte-by-byte (%C3%A0 → "à").
+        if (HttpRequest.UrlDecode("/%C3%A0-propos") == "/à-propos"
+            && HttpRequest.UrlDecode("/a%20b.png") == "/a b.png") {
+            Console.WriteLine("[PASS] UrlDecode handles UTF-8 + spaces")
+        } else {
+            Console.WriteLine("[FAIL] UrlDecode got '"
+                + HttpRequest.UrlDecode("/%C3%A0-propos") + "'")
+        }
+
+        Console.WriteLine("done")
+    }
+}

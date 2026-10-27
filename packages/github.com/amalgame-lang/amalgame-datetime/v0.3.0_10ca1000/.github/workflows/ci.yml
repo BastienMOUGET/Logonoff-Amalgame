@@ -1,0 +1,48 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  test:
+    name: Test against amc ${{ matrix.amc-tag }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # Requires amc 0.7.7+ for the cross-class external forward
+        # decl fix (RegisterExternalProg 2-pass split). Earlier amc
+        # versions mis-resolve the return type of a method that
+        # returns another class from the same facade.
+        amc-tag: [v0.7.7]
+    steps:
+      - name: Checkout package
+        uses: actions/checkout@v4
+
+      - name: Install system deps
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y libgc-dev libcurl4-openssl-dev
+
+      - name: Download amc ${{ matrix.amc-tag }}
+        run: |
+          set -e
+          TAG="${{ matrix.amc-tag }}"
+          VERSION="${TAG#v}"
+          curl -sSL -o amc.tar.gz \
+            "https://github.com/amalgame-lang/Amalgame/releases/download/${TAG}/amc-${VERSION}-linux-x86_64.tar.gz"
+          mkdir -p $RUNNER_TEMP/amc-install
+          tar -xzf amc.tar.gz -C $RUNNER_TEMP/amc-install --strip-components=1
+          echo "AMC=$RUNNER_TEMP/amc-install/amc" >> $GITHUB_ENV
+          echo "AMC_RUNTIME=$RUNNER_TEMP/amc-install/runtime" >> $GITHUB_ENV
+
+      - name: Verify amc
+        run: $AMC --version
+
+      - name: Run tests
+        run: ./tests/run_tests.sh "$AMC"

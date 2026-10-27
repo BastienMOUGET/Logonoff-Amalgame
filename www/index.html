@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="fr">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Logonoff</title>
+  <meta name="description" content="Temps de présence et temps passé par projet">
+  <meta name="theme-color" content="#0f766e">
+  <link rel="manifest" href="/manifest.webmanifest">
+  <link rel="icon" type="image/png" href="/favicon.png">
+  <link rel="apple-touch-icon" href="/icon-192.png">
+  <link rel="stylesheet" href="/style.css">
+  <script src="/app.js" defer></script>
+</head>
+<body>
+  <header class="top">
+    <a class="brand" href="#today"><img src="/favicon.png" alt="" width="28" height="28"><span>Logonoff</span></a>
+    <nav class="tabs" id="tabs">
+      <a href="#today" data-view="today">Aujourd'hui</a>
+      <a href="#day" data-view="day">Journée</a>
+      <a href="#week" data-view="week">Semaine</a>
+      <a href="#projects" data-view="projects">Projets</a>
+      <a href="#report" data-view="report">Rapport</a>
+      <a href="#settings" data-view="settings">Paramètres</a>
+    </nav>
+    <div class="who" id="who"></div>
+  </header>
+  <main id="view" class="view" aria-live="polite"></main>
+  <div id="toast" class="toast" role="status" hidden></div>
+</body>
+</html>

@@ -1,0 +1,98 @@
+# amalgame-tls — TLS 1.2 / 1.3 client + server primitives.
+#
+# Wraps OpenSSL 3.x (or LibreSSL — same ABI). Used as the foundation
+# layer for amalgame-net-http and amalgame-web (Mosaic).
+#
+# Install:
+#   amc package add tls
+#
+# System prerequisites:
+#   Linux  (Debian/Ubuntu) : sudo apt install libssl-dev
+#   Linux  (Fedora/RHEL)   : sudo dnf install openssl-devel
+#   macOS  (Homebrew)      : brew install openssl@3
+#   Windows (msys2)        : pacman -S mingw-w64-x86_64-openssl
+#
+# See proposal: docs/proposals/amalgame-web.md (§4.1)
+
+[package]
+name              = "amalgame-tls"
+version           = "0.3.6"
+license           = "Apache-2.0"
+description       = "TLS 1.2/1.3 primitives + native ACME (RFC 8555) cert provisioning. v0.3.3 ships AcmeNative.CertDaysRemaining + NeedsRenewal helpers for embedded auto-renewal patterns (replaces the cmd/acme-renew CLI dropped in this release)."
+required-amalgame = ">=0.8.39"
+schema-version    = 1
+
+# Runtime dependencies on other Amalgame packages.  amc >= 0.8.39
+# auto-pulls these recursively when `amc package add tls` is run,
+# so users never have to install crypto separately.  Older amc
+# versions silently ignore this table — the consumer hits
+# "Unknown symbol 'JwsKey'" at compile time and runs `amc package
+# add crypto` manually.
+[dependencies]
+
+[dependencies.amalgame-crypto]
+git = "github.com/amalgame-lang/amalgame-crypto"
+tag = "v0.8.0"
+[stdlib]
+# Multi-class manifest. v0.3.0 adds AcmeNative (pure-Amalgame RFC 8555
+# state machine on top of crypto v0.3.0's JwsKey + the runtime's
+# Amalgame_Tls_Acme.h HTTPS/CSR primitives).
+classes   = ["TlsConfig", "TlsContext", "TlsStream", "Acme", "AcmeNative",
+             "AcmeDirectory", "AmalgameTlsAcmeHttpResponse"]
+header    = "runtime/Amalgame_Tls.h"
+namespace = "Amalgame.Tls"
+facade    = "acme.am"
+# `-lssl -lcrypto` appended to the final link line. Both ship with
+# OpenSSL on every supported OS (and with LibreSSL, drop-in compat).
+libs      = ["ssl", "crypto"]
+
+[stdlib.functions]
+# ── TlsConfig — builder ─────────────────────────────────────────────
+TlsConfig_Default            = { returns = "AmalgameTlsConfig*" }
+TlsConfig_WithCertFile       = { returns = "AmalgameTlsConfig*" }
+TlsConfig_WithCertBytes      = { returns = "AmalgameTlsConfig*" }
+TlsConfig_WithClientAuth     = { returns = "AmalgameTlsConfig*" }
+TlsConfig_WithMinVersion     = { returns = "AmalgameTlsConfig*" }
+TlsConfig_WithAlpn           = { returns = "AmalgameTlsConfig*" }
+TlsConfig_WithSessionTickets = { returns = "AmalgameTlsConfig*" }
+TlsConfig_WithInsecureSkipVerify = { returns = "AmalgameTlsConfig*" }
+
+# ── TlsContext — server / client SSL_CTX ────────────────────────────
+TlsContext_Server            = { returns = "AmalgameTlsContext*" }
+TlsContext_Client            = { returns = "AmalgameTlsContext*" }
+TlsContext_LastError         = { returns = "code_string" }
+
+# ── TlsStream — TLS over a raw fd ───────────────────────────────────
+TlsStream_Wrap               = { returns = "AmalgameTlsStream*" }
+TlsStream_Handshake          = { returns = "code_bool" }
+TlsStream_Read               = { returns = "i64" }
+TlsStream_Write              = { returns = "i64" }
+TlsStream_ReadBytes          = { returns = "i64" }
+TlsStream_WriteBytes         = { returns = "i64" }
+TlsStream_Close              = { returns = "void" }
+TlsStream_IsConnected        = { returns = "code_bool" }
+TlsStream_LastError          = { returns = "code_string" }
+TlsStream_PeerCertSubject    = { returns = "code_string" }
+TlsStream_AlpnProto          = { returns = "code_string" }
+TlsStream_TlsVersion         = { returns = "code_string" }
+TlsStream_CipherSuite        = { returns = "code_string" }
+
+# ── Acme — Let's Encrypt cert provisioning (v0.2.0) ─────────────────
+# v0.2.0 wraps certbot (must be installed). v0.3.0 will replace this
+# with a pure-AM RFC 8555 implementation (same API surface).
+Acme_EnsureCert              = { returns = "i64" }
+Acme_EnsureCertEx            = { returns = "i64" }
+Acme_EnsureCertMulti         = { returns = "i64" }
+Acme_CertPath                = { returns = "code_string" }
+Acme_KeyPath                 = { returns = "code_string" }
+Acme_ChallengeServer         = { returns = "i64" }
+
+# ── Acme — native RFC 8555 primitives (v0.3.0+) ─────────────────────
+# These are the C-side helpers consumed by acme.am's AcmeNative state
+# machine. Not part of the public AM API — wrapped in AM helpers.
+Acme_Http                    = { returns = "AmalgameTlsAcmeHttpResponse*" }
+Acme_CsrDer_Base64Url        = { returns = "code_string" }
+Acme_SavePemFile             = { returns = "i64" }
+Acme_LoadPemFile             = { returns = "code_string" }
+Acme_SpawnChallengeServer    = { returns = "i64" }
+Acme_StopProcess             = { returns = "i64" }

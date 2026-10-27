@@ -1,0 +1,57 @@
+// amalgame-net-http — pure-Amalgame HTTP/1.1 client + server.
+//
+// As of v0.4.6 the facade is split across multiple files (see
+// `sources = [...]` in amalgame.toml). This file declares the
+// namespace and hosts the cross-cutting documentation; each class
+// lives in its own source:
+//
+//   cookie.am          Cookie (Set-Cookie helper)
+//   http_request.am    HttpRequest (parsed request)
+//   http_response.am   HttpResponse (builder + render, with CRLF guard)
+//   http_parser.am     HttpParser (HTTP/1.1 wire parser)
+//   http_server.am     HttpServer (low-level helpers)
+//   http_client.am     HttpRequestBuilder + ParsedUrl + HttpClient
+//
+// All files share `namespace Amalgame.Net.Http`. Cross-file refs
+// resolve in the order amalgame.toml's `sources = [...]` lists them.
+//
+// Compiled by `amc package add` through:
+//   amc --lib --quiet facade.am <sources...> -o build/<plat>/AmalgameNetHttp-facade
+//   gcc -c build/<plat>/AmalgameNetHttp-facade.c -o ...
+//   ar  rcs build/<plat>/libamalgame-pkg-HttpRequest.a ...
+//
+// User code that imports Amalgame.Net.Http gets forward decls only;
+// symbols resolve at link time from the per-package archive.
+//
+// Architecture:
+//   - HTTP/1.1 parsing is 100% pure AM (string manipulation —
+//     Amalgame's strength).
+//   - Socket I/O delegates to amalgame-net (Amalgame.Net.TcpServer /
+//     TcpClient).
+//   - HTTPS delegates to amalgame-tls (Amalgame.Tls.TlsStream).
+//   - HTTP/2 lives in the C runtime header (nghttp2 binding); the
+//     AM-side API stays the same.
+//   - HttpServerConfig (v0.4.3+) is the C-struct that ServeWith
+//     variants consume — defined in the runtime header, not in any
+//     AM source.
+
+namespace Amalgame.Net.Http
+
+import Amalgame.Collections
+import Amalgame.String
+import Amalgame.Net
+
+// v0.7.0: pull the package's runtime header into every @c {} block
+// so HttpRequest.FromH1Conn / HttpResponse.WriteToH1Conn (which cast
+// the conn-as-int back to AmalgameH1Conn*) can name the struct.
+// Each generated .c sees this declaration at the top, which is
+// enough — _runtime.h provides stdint.h transitively for uintptr_t.
+@c {
+    #include "Amalgame_Net_Http.h"
+}
+
+// NOTE: TLS integration (server-side HTTPS, client HTTPS, ALPN) is
+// deferred to v0.1.x. v0.1 keeps `tlsCtx` parameters typed as `any`
+// (always null) so we don't impose a build-time dependency on
+// amalgame-tls. v0.1.x will swap `any → any` and add the
+// `import Amalgame.Tls` once the package mechanism wires it through.

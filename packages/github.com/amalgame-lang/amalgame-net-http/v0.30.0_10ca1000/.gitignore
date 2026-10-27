@@ -1,0 +1,7 @@
+# Build artefacts (per-project, not the package facade)
+examples/*/server
+examples/*/server.c
+examples/*/server.log
+examples/*/_routes.am
+examples/*/amalgame.lock
+v0.*_*

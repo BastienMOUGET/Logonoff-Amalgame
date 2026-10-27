@@ -1,0 +1,41 @@
+# Package manifest — amalgame-crypto
+#
+# Pure-Amalgame crypto facade — SHA-256 (FIPS 180-4) and
+# HMAC-SHA-256 (RFC 2104) primitives. Originally bundled in amc's
+# src/stdlib/crypto.am; extracted into this external package as
+# part of the framework split (project F follow-up, amc >= 0.7.5).
+#
+# Installation:
+#
+#   amc package add crypto                  # via curated index
+#   amc package add github.com/amalgame-lang/amalgame-crypto@v0.1.0
+#
+# At install time amc precompiles `facade.am` into
+# `<pkg-cache>/build/<platform>/libamalgame-pkg-Crypto.a` (PR #377
+# infra). User builds then auto-pass `--external facade.am` and
+# auto-link the archive.
+
+[package]
+name              = "amalgame-crypto"
+version           = "0.8.0"
+license           = "Apache-2.0"
+description       = "Crypto facade for Amalgame: SHA-256, HMAC-SHA-256, AES-256-GCM AEAD, ECDH P-256 + AES-128-GCM (v0.8.0, for Web Push). v0.8.0 adds the primitives RFC 8291 Web Push message encryption needs: Ecdh.GenerateP256() (ephemeral key agreement keypair), Ecdh.PublicRaw() (65-byte uncompressed point for the aes128gcm header + HKDF info), Ecdh.Derive(peerPublic65) (the 32-byte ECDH shared secret with the subscriber's p256dh key, via EVP_PKEY_derive), and Aead.SealAes128Gcm(key16, nonce12, aad, plaintext) (the 128-bit AES-GCM the aes128gcm content-encoding uses, vs the existing 256-bit). HKDF-SHA256 is pure-AM on top of Hmac.Sha256, so it stays in the consumer. Verified: ECDH agreement matches both ways (32 bytes) + AES-128-GCM seal length. Earlier: ES256/RS256 JWS signing (RFC 7515), memory-hard password hashing (Password.Hash/Verify, scrypt), and TOTP 2FA — HMAC-SHA-1 (Hmac.Sha1), Base32 (RFC 4648), and Totp (RFC 6238: At/Now/Verify, constant-time compare + clock-skew window) compatible with Google Authenticator. v0.7.0 adds the WebAuthn/COSE verification primitives: JwsKey.FromCoseEc2(x, y) builds a verify-only ES256 (P-256) public key from the COSE_Key EC2 affine coordinates an authenticator returns (EVP_PKEY_fromdata, uncompressed point), and JwsKey.VerifyDer / SignDer handle signatures in their NATIVE encoding (ASN.1 DER ECDSA / PKCS#1 RSA) — the form WebAuthn assertions and X.509 certs carry, vs JWS raw R‖S. Validated by an ES256 sign-DER → export coords → re-import via FromCoseEc2 → VerifyDer round-trip (+ tampered-message rejection). v0.6.0 adds JwsKey.FromJwkRsa(n, e) — build a verify-only RS256 public key from a JWK's base64url modulus + exponent (EVP_PKEY_fromdata), the primitive an OIDC client needs to check an id_token against the IdP's published JWKS; the key can only verify (never sign), and an out-of-range modulus (outside 2048..8192 bits) is refused as a DoS guard. Validated against the RFC 6238 test vectors and an RSA JWK round-trip (export public JWK → re-import n/e → verify a real signature, reject tampered input)."
+authors           = ["Bastien Mouget"]
+required-amalgame = ">=0.7.6"
+schema-version    = 1
+
+[stdlib]
+# v0.1.0 — Sha256 + Hmac (pure-AM via @c {} blocks).
+# v0.2.0 — Aead + AeadResult (AES-256-GCM via OpenSSL EVP).
+# v0.3.0 — JwsKey (ES256 / RS256 signing + verification for JWS / ACME).
+# v0.4.0 — Password (memory-hard hashing, scrypt backend, constant-time verify).
+classes   = ["Sha256", "Hmac", "Aead", "AeadResult", "Bytes", "JwsKey", "Password", "Base32", "Totp", "Ecdh"]
+header    = "facade-stub.h"
+namespace = "Amalgame.Crypto"
+facade    = "facade.am"
+
+# v0.2.0: link libcrypto for AES-256-GCM (EVP_aes_256_gcm).
+# OpenSSL is already in the dependency tree of every Mosaic app
+# (amalgame-tls links it for TLS), so this doesn't enlarge the
+# external footprint.
+libs      = ["crypto"]

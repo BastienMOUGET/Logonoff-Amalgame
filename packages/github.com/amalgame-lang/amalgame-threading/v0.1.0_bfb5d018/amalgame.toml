@@ -1,0 +1,109 @@
+# Package manifest — amalgame-threading
+#
+# Threading primitives for Amalgame: Mutex, Channel, Thread.
+# Wraps the POSIX pthread API on Unix-like systems (libgc is
+# already configured with thread support in every distro build).
+# Windows MSYS2 / MinGW also ships pthread-w32 so the same API
+# works there. Native Windows threads (Vista CRITICAL_SECTION) is
+# a v2 concern — too much #ifdef churn for v0.1.0.
+#
+# Why this package matters:
+#   - Today, every Amalgame package that needs concurrency
+#     hand-rolls @c {} blocks for pthread + bdwgc thread
+#     registration. This package centralises the safe pattern.
+#   - Channel + Closure unlocks the "spawn a worker, pass values
+#     through a queue" idiom that's natural for HTTP servers,
+#     audio pipelines, websocket fan-out, etc.
+#
+# Surface (v1):
+#   Mutex.New / mutex.Lock / Unlock / TryLock
+#
+#   Channel.New(capacity) — bounded FIFO of i64-erased values
+#     ch.Send(value)                blocks if full
+#     ch.Receive() : void*          blocks if empty (null if closed)
+#     ch.TrySend(value) : bool      non-blocking; false if full
+#     ch.TryReceive() : void*       non-blocking; null if empty
+#     ch.Close() / IsClosed()
+#     ch.Count() / Capacity()
+#
+#   Thread.Spawn(closure, arg)    runs closure(arg) on a fresh
+#                                 thread; closure is a 1-arg
+#                                 AmalgameClosure (use null/0
+#                                 arg if you don't care)
+#   Thread.Join(t)                wait for thread completion
+#   Thread.Sleep(ms)              static, current thread sleeps
+#
+# Threading model: AmalgameClosure captures locals by value at
+# creation time, so the spawned thread sees a snapshot. Mutate
+# shared state through Channel (preferred) or Mutex.
+#
+# bdwgc safety: GC_pthread_create registers each new thread with
+# the GC so locals on the thread's stack stay scannable. Don't
+# bypass with raw pthread_create — locals would become invisible
+# to the collector and either get freed early or pin live
+# objects forever.
+#
+# Out of scope (v2):
+#   - Native Windows threads (the API works on MSYS2 / MinGW
+#     today; vanilla MSVC needs CRITICAL_SECTION shim)
+#   - ThreadPool (build on top of Spawn + Channel in user code,
+#     or wait for v2)
+#   - ReadWriteLock / Semaphore / Condition (user composes from
+#     Mutex + Channel)
+#   - Thread-local storage
+#   - Atomic primitives (single-writer + Channel suffices for now)
+#   - async/await — separate language work, not a runtime feature
+#
+# Installation:
+#
+#   amc package add threading                                # via index
+#   amc package add github.com/amalgame-lang/amalgame-threading@v0.1.0
+
+[package]
+name              = "amalgame-threading"
+version           = "0.1.0"
+license           = "Apache-2.0"
+description       = "Threading primitives for Amalgame — Mutex, Channel, Thread.Spawn/Join/Sleep on top of pthread + bdwgc-safe registration."
+authors           = ["Bastien Mouget"]
+required-amalgame = ">=0.8.19"
+schema-version    = 1
+
+[stdlib]
+class     = "Threading"
+header    = "runtime/Amalgame_Threading.h"
+namespace = "Amalgame.Threading"
+
+# No vendored sources — pthread is built into the platform on
+# every supported OS (POSIX libc, Windows pthread-w32 via MSYS2).
+# libgc is already linked + configured with GC_THREADS by the
+# main Amalgame runtime.
+
+# Link against pthread. amc forwards `-lpthread` to the user's
+# gcc step. libgc is already in the runtime's default linkage.
+libs       = ["pthread"]
+
+[stdlib.functions]
+# Mutex
+MutexNew        = { returns = "AmalgameMutex*" }
+MutexLock       = { returns = "void" }
+MutexUnlock     = { returns = "void" }
+MutexTryLock    = { returns = "code_bool" }
+
+# Channel
+ChannelNew      = { returns = "AmalgameChannel*" }
+ChannelSend     = { returns = "code_bool" }
+ChannelReceive  = { returns = "i64" }
+ChannelTrySend  = { returns = "code_bool" }
+ChannelTryReceive = { returns = "i64" }
+ChannelClose    = { returns = "void" }
+ChannelIsClosed = { returns = "code_bool" }
+ChannelCount    = { returns = "i64" }
+ChannelCapacity = { returns = "i64" }
+
+# Thread
+ThreadSpawn     = { returns = "AmalgameThread*" }
+ThreadJoin      = { returns = "void" }
+ThreadSleep     = { returns = "void" }
+ThreadIsAlive   = { returns = "code_bool" }
+
+[dependencies]

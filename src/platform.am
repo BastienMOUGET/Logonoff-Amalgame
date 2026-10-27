@@ -1,0 +1,579 @@
+namespace Logonoff
+
+import Amalgame.Collections
+
+// ── Platform ──────────────────────────────────────────
+//
+// OS glue that has no home in a package yet: install paths, "which
+// local user owns this TCP connection", default-gateway MAC (network
+// location), a one-shot tray balloon, opening a URL.
+//
+// Windows is the target; the POSIX branches exist so the whole app
+// builds and runs on Linux for development (identity from
+// /proc/net/tcp, gateway from /proc/net/route + /proc/net/arp).
+//
+// iphlpapi is resolved at runtime like wtsapi32 in amalgame-service:
+// MinGW doesn't link it by default and a project build has no
+// per-platform link flags.
+
+@c {
+    #include <stdio.h>
+    #include <stdlib.h>
+    #include <string.h>
+    #include <stdint.h>
+    #include <time.h>
+    #ifdef _WIN32
+        #ifndef _WIN32_WINNT
+            #define _WIN32_WINNT 0x0601
+        #endif
+        #include <winsock2.h>
+        #include <ws2tcpip.h>
+        #include <windows.h>
+        #include <iphlpapi.h>
+        #include <sddl.h>
+        #include <shellapi.h>
+        #include <direct.h>
+    #else
+        #include <unistd.h>
+        #include <pwd.h>
+        #include <sys/stat.h>
+        #include <errno.h>
+    #endif
+
+    static char* Logonoff_Dup(const char* s) {
+        if (!s) s = "";
+        size_t n = strlen(s);
+        char* out = (char*) GC_MALLOC(n + 1);
+        memcpy(out, s, n + 1);
+        return out;
+    }
+
+    /* UTF-8 → Windows-1252 (accents are Latin-1 there; the 0x80–0x9F
+     * block holds €, œ, ’, « … ). Unmappable code points become '?'.
+     * Pure C: same output on every OS. */
+    static char* Logonoff_ToCp1252(const char* s) {
+        static const unsigned short hi[32] = {
+            0x20AC, 0, 0x201A, 0x0192, 0x201E, 0x2026, 0x2020, 0x2021, 0x02C6, 0x2030, 0x0160, 0x2039, 0x0152, 0, 0x017D, 0,
+            0, 0x2018, 0x2019, 0x201C, 0x201D, 0x2022, 0x2013, 0x2014, 0x02DC, 0x2122, 0x0161, 0x203A, 0x0153, 0, 0x017E, 0x0178 };
+        if (!s) s = "";
+        size_t n = strlen(s);
+        char* out = (char*) GC_MALLOC_ATOMIC(n + 1);
+        size_t o = 0;
+        const unsigned char* p = (const unsigned char*) s;
+        while (*p) {
+            unsigned int cp;
+            if (p[0] < 0x80) { cp = p[0]; p += 1; }
+            else if ((p[0] & 0xE0) == 0xC0 && p[1]) { cp = ((p[0] & 0x1F) << 6) | (p[1] & 0x3F); p += 2; }
+            else if ((p[0] & 0xF0) == 0xE0 && p[1] && p[2]) { cp = ((p[0] & 0x0F) << 12) | ((p[1] & 0x3F) << 6) | (p[2] & 0x3F); p += 3; }
+            else if ((p[0] & 0xF8) == 0xF0 && p[1] && p[2] && p[3]) { cp = 0x110000; p += 4; }
+            else { cp = '?'; p += 1; }
+            unsigned char b = '?';
+            if (cp < 0x80 || (cp >= 0xA0 && cp <= 0xFF)) b = (unsigned char) cp;
+            else if (cp == 0xFEFF) { continue; }
+            else for (int i = 0; i < 32; i++) if (hi[i] && hi[i] == cp) { b = (unsigned char) (0x80 + i); break; }
+            out[o++] = (char) b;
+        }
+        out[o] = 0;
+        return out;
+    }
+
+    #ifdef _WIN32
+        #define LOGONOFF_WM_TRAY (WM_APP + 1)
+        static wchar_t* Logonoff_BalloonUrl = NULL;
+        static volatile int Logonoff_BalloonDone = 0;
+
+        /* Tray icon callback (NOTIFYICON_VERSION_4: event in LOWORD(lParam)).
+         * A click on the toast / balloon opens the URL; dismissal or
+         * timeout ends the --notify process early. */
+        static LRESULT CALLBACK Logonoff_TrayProc(HWND h, UINT m, WPARAM w, LPARAM l) {
+            if (m == LOGONOFF_WM_TRAY) {
+                UINT ev = LOWORD(l);
+                if (ev == NIN_BALLOONUSERCLICK || ev == NIN_SELECT || ev == WM_LBUTTONUP) {
+                    if (Logonoff_BalloonUrl)
+                        ShellExecuteW(NULL, L"open", Logonoff_BalloonUrl, NULL, NULL, SW_SHOWNORMAL);
+                    Logonoff_BalloonDone = 1;
+                } else if (ev == NIN_BALLOONTIMEOUT || ev == NIN_BALLOONHIDE) {
+                    Logonoff_BalloonDone = 1;
+                }
+                return 0;
+            }
+            return DefWindowProcW(h, m, w, l);
+        }
+
+        static char* Logonoff_W2U(const wchar_t* w) {
+            if (!w) return (char*) "";
+            int n = WideCharToMultiByte(CP_UTF8, 0, w, -1, NULL, 0, NULL, NULL);
+            if (n <= 0) return (char*) "";
+            char* out = (char*) GC_MALLOC(n);
+            WideCharToMultiByte(CP_UTF8, 0, w, -1, out, n, NULL, NULL);
+            return out;
+        }
+
+        static wchar_t* Logonoff_U2W(const char* s) {
+            if (!s) s = "";
+            int n = MultiByteToWideChar(CP_UTF8, 0, s, -1, NULL, 0);
+            if (n <= 0) n = 1;
+            wchar_t* out = (wchar_t*) GC_MALLOC(sizeof(wchar_t) * n);
+            out[0] = 0;
+            MultiByteToWideChar(CP_UTF8, 0, s, -1, out, n);
+            return out;
+        }
+
+        /* "S-1-5-21-…|DOMAIN|name" for a token, "" on failure. */
+        static char* Logonoff_TokenIdentity(HANDLE tok) {
+            DWORD need = 0;
+            GetTokenInformation(tok, TokenUser, NULL, 0, &need);
+            if (need == 0) return (char*) "";
+            TOKEN_USER* tu = (TOKEN_USER*) GC_MALLOC(need);
+            if (!GetTokenInformation(tok, TokenUser, tu, need, &need)) return (char*) "";
+            LPSTR sidStr = NULL;
+            if (!ConvertSidToStringSidA(tu->User.Sid, &sidStr) || !sidStr) return (char*) "";
+            char* sid = Logonoff_Dup(sidStr);
+            LocalFree(sidStr);
+            wchar_t name[256], dom[256];
+            DWORD nl = 256, dl = 256;
+            SID_NAME_USE use;
+            char* nameU = (char*) "";
+            char* domU  = (char*) "";
+            if (LookupAccountSidW(NULL, tu->User.Sid, name, &nl, dom, &dl, &use)) {
+                nameU = Logonoff_W2U(name);
+                domU  = Logonoff_W2U(dom);
+            }
+            size_t n = strlen(sid) + strlen(domU) + strlen(nameU) + 3;
+            char* out = (char*) GC_MALLOC(n);
+            snprintf(out, n, "%s|%s|%s", sid, domU, nameU);
+            return out;
+        }
+
+        typedef DWORD (WINAPI *Logonoff_PFN_GetExtTcp)(PVOID, PDWORD, BOOL, ULONG, TCP_TABLE_CLASS, ULONG);
+        typedef DWORD (WINAPI *Logonoff_PFN_GetBestRoute)(DWORD, DWORD, PMIB_IPFORWARDROW);
+        typedef DWORD (WINAPI *Logonoff_PFN_SendARP)(IPAddr, IPAddr, PVOID, PULONG);
+        static Logonoff_PFN_GetExtTcp    Logonoff_GetExtTcp    = NULL;
+        static Logonoff_PFN_GetBestRoute Logonoff_GetBestRoute = NULL;
+        static Logonoff_PFN_SendARP      Logonoff_SendARP      = NULL;
+        static INIT_ONCE Logonoff_IpOnce = INIT_ONCE_STATIC_INIT;
+
+        static BOOL CALLBACK Logonoff_IpInit(PINIT_ONCE o, PVOID p, PVOID* c) {
+            (void) o; (void) p; (void) c;
+            HMODULE h = LoadLibraryA("iphlpapi.dll");
+            if (h) {
+                Logonoff_GetExtTcp    = (Logonoff_PFN_GetExtTcp)    GetProcAddress(h, "GetExtendedTcpTable");
+                Logonoff_GetBestRoute = (Logonoff_PFN_GetBestRoute) GetProcAddress(h, "GetBestRoute");
+                Logonoff_SendARP      = (Logonoff_PFN_SendARP)      GetProcAddress(h, "SendARP");
+            }
+            return TRUE;
+        }
+
+        static void Logonoff_IpLoad(void) {
+            InitOnceExecuteOnce(&Logonoff_IpOnce, Logonoff_IpInit, NULL, NULL);
+        }
+
+        /* Owning pid of the loopback IPv4 connection whose local end is
+         * `clientPort` and remote end `serverPort`; 0 if not found. */
+        static DWORD Logonoff_PidForConn(int clientPort, int serverPort) {
+            Logonoff_IpLoad();
+            if (!Logonoff_GetExtTcp) return 0;
+            DWORD size = 0;
+            Logonoff_GetExtTcp(NULL, &size, FALSE, AF_INET, TCP_TABLE_OWNER_PID_CONNECTIONS, 0);
+            if (size == 0) return 0;
+            /* The table can grow between the two calls — retry a few times. */
+            for (int attempt = 0; attempt < 4; attempt++) {
+                size += 4096;
+                MIB_TCPTABLE_OWNER_PID* t = (MIB_TCPTABLE_OWNER_PID*) GC_MALLOC_ATOMIC(size);
+                DWORD rc = Logonoff_GetExtTcp(t, &size, FALSE, AF_INET, TCP_TABLE_OWNER_PID_CONNECTIONS, 0);
+                if (rc == ERROR_INSUFFICIENT_BUFFER) continue;
+                if (rc != NO_ERROR) return 0;
+                for (DWORD i = 0; i < t->dwNumEntries; i++) {
+                    MIB_TCPROW_OWNER_PID* r = &t->table[i];
+                    int lp = ntohs((u_short) r->dwLocalPort);
+                    int rp = ntohs((u_short) r->dwRemotePort);
+                    if (lp == clientPort && rp == serverPort
+                        && r->dwLocalAddr == htonl(INADDR_LOOPBACK))
+                        return r->dwOwningPid;
+                }
+                return 0;
+            }
+            return 0;
+        }
+    #else
+        /* uid owning the TCP connection local:clientPort → remote:serverPort
+         * per /proc/net/tcp{,6}; -1 if not found. */
+        static long Logonoff_UidForConn(int clientPort, int serverPort) {
+            const char* files[2] = { "/proc/net/tcp", "/proc/net/tcp6" };
+            for (int f = 0; f < 2; f++) {
+                FILE* fp = fopen(files[f], "r");
+                if (!fp) continue;
+                char line[512];
+                if (!fgets(line, sizeof(line), fp)) { fclose(fp); continue; }   /* header */
+                while (fgets(line, sizeof(line), fp)) {
+                    char local[64], remote[64];
+                    unsigned int st;
+                    long uid;
+                    if (sscanf(line, " %*d: %63s %63s %x %*s %*s %*s %ld", local, remote, &st, &uid) != 4)
+                        continue;
+                    char* lc = strrchr(local, ':');
+                    char* rc = strrchr(remote, ':');
+                    if (!lc || !rc) continue;
+                    int lp = (int) strtol(lc + 1, NULL, 16);
+                    int rp = (int) strtol(rc + 1, NULL, 16);
+                    if (lp == clientPort && rp == serverPort) { fclose(fp); return uid; }
+                }
+                fclose(fp);
+            }
+            return -1;
+        }
+
+        static char* Logonoff_UidIdentity(long uid) {
+            struct passwd* pw = getpwuid((uid_t) uid);
+            const char* name = pw ? pw->pw_name : "";
+            char buf[512];
+            snprintf(buf, sizeof(buf), "uid:%ld||%s", uid, name);
+            return Logonoff_Dup(buf);
+        }
+    #endif
+}
+
+public class Platform {
+    public Platform() {}
+
+    public static bool IsWindows() {
+        @c {
+        #ifdef _WIN32
+            return 1;
+        #else
+            return 0;
+        #endif
+        }
+    }
+
+    // Command-line argument `i` (0 = program) in UTF-8. On Windows the
+    // CRT hands main() an ANSI-converted argv, which mangles accents in
+    // the messages the service passes to `--notify`: re-read the wide
+    // command line instead.
+    public static string Arg(i: int) {
+        @c {
+        #ifdef _WIN32
+            int argc = 0;
+            LPWSTR* argv = CommandLineToArgvW(GetCommandLineW(), &argc);
+            if (!argv) return (char*) "";
+            char* res = (char*) "";
+            if (i >= 0 && i < argc) res = Logonoff_W2U(argv[i]);
+            LocalFree(argv);
+            return res;
+        #else
+            if (i < 0 || i >= Args_Count()) return (char*) "";
+            return Args_Get(i);
+        #endif
+        }
+    }
+
+    // Make the console display UTF-8 (Windows consoles default to an
+    // OEM code page). No-op elsewhere.
+    public static void ConsoleUtf8() {
+        @c {
+        #ifdef _WIN32
+            SetConsoleOutputCP(CP_UTF8);
+        #endif
+        }
+    }
+
+    // Directory holding the running executable (no trailing separator).
+    public static string ExeDir() {
+        @c {
+        #ifdef _WIN32
+            wchar_t buf[MAX_PATH * 2];
+            DWORD n = GetModuleFileNameW(NULL, buf, MAX_PATH * 2);
+            if (n == 0 || n >= MAX_PATH * 2) return (char*) ".";
+            wchar_t* slash = wcsrchr(buf, L'\\');
+            if (slash) *slash = 0;
+            return Logonoff_W2U(buf);
+        #else
+            char buf[4096];
+            ssize_t n = readlink("/proc/self/exe", buf, sizeof(buf) - 1);
+            if (n <= 0) return (char*) ".";
+            buf[n] = 0;
+            char* slash = strrchr(buf, '/');
+            if (slash) *slash = 0;
+            return Logonoff_Dup(buf);
+        #endif
+        }
+    }
+
+    // Environment variable, "" when unset.
+    public static string Env(name: string) {
+        @c {
+        #ifdef _WIN32
+            wchar_t buf[4096];
+            DWORD n = GetEnvironmentVariableW(Logonoff_U2W(name), buf, 4096);
+            if (n == 0 || n >= 4096) return (char*) "";
+            return Logonoff_W2U(buf);
+        #else
+            const char* v = getenv(name);
+            return Logonoff_Dup(v ? v : "");
+        #endif
+        }
+    }
+
+    // mkdir -p. True if the directory exists afterwards.
+    public static bool EnsureDir(path: string) {
+        @c {
+            size_t len = strlen(path);
+            char* buf = (char*) GC_MALLOC(len + 1);
+            memcpy(buf, path, len + 1);
+            for (size_t i = 1; i <= len; i++) {
+                if (i == len || buf[i] == '/' || buf[i] == '\\') {
+                    char c = buf[i];
+                    buf[i] = 0;
+                    if (!(i == 2 && buf[1] == ':')) {
+                    #ifdef _WIN32
+                        CreateDirectoryW(Logonoff_U2W(buf), NULL);
+                    #else
+                        mkdir(buf, 0755);
+                    #endif
+                    }
+                    buf[i] = c;
+                }
+            }
+        #ifdef _WIN32
+            DWORD a = GetFileAttributesW(Logonoff_U2W(path));
+            return (a != INVALID_FILE_ATTRIBUTES && (a & FILE_ATTRIBUTE_DIRECTORY)) ? 1 : 0;
+        #else
+            struct stat st;
+            return (stat(path, &st) == 0 && S_ISDIR(st.st_mode)) ? 1 : 0;
+        #endif
+        }
+    }
+
+    public static bool FileExists(path: string) {
+        @c {
+        #ifdef _WIN32
+            DWORD a = GetFileAttributesW(Logonoff_U2W(path));
+            return (a != INVALID_FILE_ATTRIBUTES && !(a & FILE_ATTRIBUTE_DIRECTORY)) ? 1 : 0;
+        #else
+            struct stat st;
+            return (stat(path, &st) == 0 && S_ISREG(st.st_mode)) ? 1 : 0;
+        #endif
+        }
+    }
+
+    // Identity of the local process owning the browser end of a
+    // loopback connection, as "id|domain|name" ("S-1-5-21-…|PC|bob"
+    // on Windows, "uid:1000||bob" on Linux). "" if it can't be
+    // resolved — the caller must then refuse the request.
+    public static string PeerIdentity(clientPort: int, serverPort: int) {
+        @c {
+        #ifdef _WIN32
+            DWORD pid = Logonoff_PidForConn((int) clientPort, (int) serverPort);
+            if (pid == 0) return (char*) "";
+            HANDLE ph = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+            if (!ph) return (char*) "";
+            HANDLE tok = NULL;
+            char* res = (char*) "";
+            if (OpenProcessToken(ph, TOKEN_QUERY, &tok)) {
+                res = Logonoff_TokenIdentity(tok);
+                CloseHandle(tok);
+            }
+            CloseHandle(ph);
+            return res;
+        #else
+            long uid = Logonoff_UidForConn((int) clientPort, (int) serverPort);
+            if (uid < 0) return (char*) "";
+            return Logonoff_UidIdentity(uid);
+        #endif
+        }
+    }
+
+    // Identity of this process, same format as PeerIdentity. Used in
+    // console mode, where session tokens are out of reach.
+    public static string CurrentIdentity() {
+        @c {
+        #ifdef _WIN32
+            HANDLE tok = NULL;
+            if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &tok)) return (char*) "";
+            char* res = Logonoff_TokenIdentity(tok);
+            CloseHandle(tok);
+            return res;
+        #else
+            return Logonoff_UidIdentity((long) getuid());
+        #endif
+        }
+    }
+
+    // "gatewayIp|gatewayMac" of the default route, "" when offline.
+    // The MAC identifies a network far better than the gateway IP
+    // (every home box answers on 192.168.1.1).
+    public static string DefaultGateway() {
+        @c {
+        #ifdef _WIN32
+            Logonoff_IpLoad();
+            if (!Logonoff_GetBestRoute) return (char*) "";
+            MIB_IPFORWARDROW row;
+            memset(&row, 0, sizeof(row));
+            /* Any public address works: we only want the next hop. */
+            if (Logonoff_GetBestRoute(inet_addr("1.1.1.1"), 0, &row) != NO_ERROR) return (char*) "";
+            DWORD gw = row.dwForwardNextHop;
+            if (gw == 0) return (char*) "";
+            struct in_addr ia;
+            ia.s_addr = gw;
+            char ip[32];
+            snprintf(ip, sizeof(ip), "%s", inet_ntoa(ia));
+            char mac[32] = "";
+            if (Logonoff_SendARP) {
+                BYTE m[8];
+                ULONG ml = sizeof(m);
+                if (Logonoff_SendARP((IPAddr) gw, 0, m, &ml) == NO_ERROR && ml >= 6)
+                    snprintf(mac, sizeof(mac), "%02x:%02x:%02x:%02x:%02x:%02x",
+                             m[0], m[1], m[2], m[3], m[4], m[5]);
+            }
+            char out[80];
+            snprintf(out, sizeof(out), "%s|%s", ip, mac);
+            return Logonoff_Dup(out);
+        #else
+            FILE* fp = fopen("/proc/net/route", "r");
+            if (!fp) return (char*) "";
+            char line[512], ip[32] = "";
+            if (!fgets(line, sizeof(line), fp)) { fclose(fp); return (char*) ""; }
+            while (fgets(line, sizeof(line), fp)) {
+                char ifn[64];
+                unsigned long dest, gw;
+                if (sscanf(line, "%63s %lx %lx", ifn, &dest, &gw) == 3 && dest == 0 && gw != 0) {
+                    unsigned char* b = (unsigned char*) &gw;
+                    snprintf(ip, sizeof(ip), "%u.%u.%u.%u", b[0], b[1], b[2], b[3]);
+                    break;
+                }
+            }
+            fclose(fp);
+            if (!ip[0]) return (char*) "";
+            char mac[32] = "";
+            fp = fopen("/proc/net/arp", "r");
+            if (fp) {
+                if (fgets(line, sizeof(line), fp)) {
+                    while (fgets(line, sizeof(line), fp)) {
+                        char aip[64], hw[64];
+                        if (sscanf(line, "%63s %*s %*s %63s", aip, hw) == 2 && strcmp(aip, ip) == 0) {
+                            snprintf(mac, sizeof(mac), "%s", hw);
+                            break;
+                        }
+                    }
+                }
+                fclose(fp);
+            }
+            char out[80];
+            snprintf(out, sizeof(out), "%s|%s", ip, mac);
+            return Logonoff_Dup(out);
+        #endif
+        }
+    }
+
+    // Show a tray balloon (rendered as a toast on Windows 10/11) for up
+    // to `seconds`, then remove the icon. Clicking it opens `url` (if
+    // not empty) in the default browser. Must run in the user's
+    // session — the service starts `logonoff.exe --notify …` there
+    // through Service.LaunchInSession. Prints to stdout elsewhere.
+    public static void ShowBalloon(title: string, message: string, seconds: int, url: string) {
+        @c {
+        #ifdef _WIN32
+            Logonoff_BalloonUrl = (url && *url) ? Logonoff_U2W(url) : NULL;
+            Logonoff_BalloonDone = 0;
+            WNDCLASSW wc;
+            ZeroMemory(&wc, sizeof(wc));
+            wc.lpfnWndProc   = Logonoff_TrayProc;
+            wc.hInstance     = GetModuleHandleW(NULL);
+            wc.lpszClassName = L"LogonoffTray";
+            RegisterClassW(&wc);
+            HWND hwnd = CreateWindowExW(0, L"LogonoffTray", L"Logonoff", 0, 0, 0, 0, 0,
+                                        HWND_MESSAGE, NULL, GetModuleHandleW(NULL), NULL);
+            NOTIFYICONDATAW nid;
+            ZeroMemory(&nid, sizeof(nid));
+            nid.cbSize = sizeof(nid);
+            nid.hWnd   = hwnd;
+            nid.uID    = 1;
+            nid.uFlags = NIF_ICON | NIF_TIP | NIF_INFO | NIF_MESSAGE;
+            nid.uCallbackMessage = LOGONOFF_WM_TRAY;
+            HICON ico = LoadIconW(GetModuleHandleW(NULL), MAKEINTRESOURCEW(1));
+            nid.hIcon = ico ? ico : LoadIconW(NULL, (LPCWSTR) IDI_INFORMATION);
+            wcsncpy(nid.szTip, L"Logonoff", 63);
+            wcsncpy(nid.szInfoTitle, Logonoff_U2W(title), 63);
+            wcsncpy(nid.szInfo, Logonoff_U2W(message), 255);
+            nid.dwInfoFlags = NIIF_INFO;
+            Shell_NotifyIconW(NIM_ADD, &nid);
+            nid.uVersion = NOTIFYICON_VERSION_4;
+            Shell_NotifyIconW(NIM_SETVERSION, &nid);
+            DWORD end = GetTickCount() + (DWORD) (seconds > 0 ? seconds : 8) * 1000;
+            MSG msg;
+            while (GetTickCount() < end && !Logonoff_BalloonDone) {
+                while (PeekMessageW(&msg, NULL, 0, 0, PM_REMOVE)) {
+                    TranslateMessage(&msg);
+                    DispatchMessageW(&msg);
+                }
+                Sleep(100);
+            }
+            Shell_NotifyIconW(NIM_DELETE, &nid);
+            if (hwnd) DestroyWindow(hwnd);
+        #else
+            (void) seconds;
+            printf("[notification] %s — %s %s\n", title, message, url);
+            fflush(stdout);
+        #endif
+        }
+    }
+
+    // Send stdout + stderr to `path` (append, unbuffered). A service
+    // has no console: this file is the only trace of what it does.
+    public static bool LogToFile(path: string) {
+        @c {
+        #ifdef _WIN32
+            FILE* f1 = _wfreopen(Logonoff_U2W(path), L"a", stdout);
+            FILE* f2 = _wfreopen(Logonoff_U2W(path), L"a", stderr);
+        #else
+            FILE* f1 = freopen(path, "a", stdout);
+            FILE* f2 = freopen(path, "a", stderr);
+        #endif
+            if (f1) setvbuf(stdout, NULL, _IONBF, 0);
+            if (f2) setvbuf(stderr, NULL, _IONBF, 0);
+            return (f1 && f2) ? 1 : 0;
+        }
+    }
+
+    // One timestamped line on stdout (→ the log file for a service).
+    public static void Log(message: string) {
+        @c {
+            time_t t = time(NULL);
+            struct tm lt;
+        #ifdef _WIN32
+            localtime_s(&lt, &t);
+        #else
+            localtime_r(&t, &lt);
+        #endif
+            char ts[32];
+            strftime(ts, sizeof(ts), "%Y-%m-%d %H:%M:%S", &lt);
+            printf("%s  %s\n", ts, message);
+            fflush(stdout);
+        }
+    }
+
+    // End the process now (atexit handlers run: the SCM gets its
+    // STOPPED status). Used once the data is saved, because on Windows
+    // a thread blocked in accept() is not woken by shutdown().
+    public static void Exit(code: int) {
+        @c { fflush(stdout); exit((int) code); }
+    }
+
+    // UTF-8 → Windows-1252 for exports to tools that expect "ANSI".
+    public static string ToCp1252(s: string) {
+        @c { return Logonoff_ToCp1252(s); }
+    }
+
+    // Open `url` in the default browser of the current user.
+    public static void OpenUrl(url: string) {
+        @c {
+        #ifdef _WIN32
+            ShellExecuteW(NULL, L"open", Logonoff_U2W(url), NULL, NULL, SW_SHOWNORMAL);
+        #else
+            char cmd[2048];
+            snprintf(cmd, sizeof(cmd), "xdg-open '%s' >/dev/null 2>&1 &", url);
+            if (system(cmd) != 0) { /* best effort */ }
+        #endif
+        }
+    }
+}

@@ -1,0 +1,515 @@
+// Test sample for amalgame-framework-crypto.
+//
+// Imports the Amalgame.Crypto module + uses Sha256 / Hmac
+// classes to verify that the extracted facade produces correct
+// FIPS 180-4 / RFC 2104 outputs against published test vectors.
+//
+// Note: avoid the bare keyword "ns"+"pace" in comments — see the
+// encoding sample for the rationale.
+
+namespace UserApp
+
+import Amalgame.Crypto
+import Amalgame.Collections
+import Amalgame.String
+
+public class Program {
+    public static void Main() {
+        // ── SHA-256 of "" (NIST CAVP empty vector) ────
+        let empty: string = Sha256.OfString("")
+        if (empty == "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855") {
+            Console.WriteLine("[PASS] sha256 empty")
+        } else {
+            Console.WriteLine("[FAIL] sha256 empty got '" + empty + "'")
+        }
+
+        // ── SHA-256 of "abc" (FIPS 180-4 Appendix B.1) ─
+        let abc: string = Sha256.OfString("abc")
+        if (abc == "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad") {
+            Console.WriteLine("[PASS] sha256 abc")
+        } else {
+            Console.WriteLine("[FAIL] sha256 abc got '" + abc + "'")
+        }
+
+        // ── HMAC-SHA-256 — RFC 4231 Test Case 1 ───────
+        // key   = 0x0b * 20 (20 bytes of 0x0b)
+        // data  = "Hi There"
+        // hmac  = b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7
+        let key: List<int> = new List<int>()
+        for i in 0..20 {
+            key.Add(11) // 0x0b
+        }
+        let msg: List<int> = new List<int>()
+        msg.Add(72)  // H
+        msg.Add(105) // i
+        msg.Add(32)  // space
+        msg.Add(84)  // T
+        msg.Add(104) // h
+        msg.Add(101) // e
+        msg.Add(114) // r
+        msg.Add(101) // e
+        let h: string = Hmac.Sha256Hex(key, msg)
+        if (h == "b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7") {
+            Console.WriteLine("[PASS] hmac rfc4231 tc1")
+        } else {
+            Console.WriteLine("[FAIL] hmac got '" + h + "'")
+        }
+
+        // ── HMAC convenience: OfStrings ───────────────
+        let h2: string = Hmac.Sha256OfStrings("key", "The quick brown fox jumps over the lazy dog")
+        if (h2 == "f7bc83f430538424b13298e6aa6fb143ef4d59a14946175997479dbc2d1a3cd8") {
+            Console.WriteLine("[PASS] hmac fox")
+        } else {
+            Console.WriteLine("[FAIL] hmac fox got '" + h2 + "'")
+        }
+
+        // ─────────────────────────────────────────────────
+        // v0.2 — AES-256-GCM AEAD
+        // ─────────────────────────────────────────────────
+
+        // Build a 32-byte key and 12-byte nonce of all-zeroes.
+        // For the all-zero key+nonce + empty plaintext + empty AAD,
+        // NIST SP 800-38D + reference vectors give a known tag:
+        //   tag = 0x530f8afbc74536b9a963b4f1c4cb738b
+        let zeroKey: List<int> = new List<int>()
+        for i in 0..32 { zeroKey.Add(0) }
+        let zeroNonce: List<int> = new List<int>()
+        for j in 0..12 { zeroNonce.Add(0) }
+        let emptyAad: List<int> = new List<int>()
+        let emptyPt:  List<int> = new List<int>()
+
+        let sealedEmpty: List<int> = Aead.SealAes256Gcm(zeroKey, zeroNonce, emptyAad, emptyPt)
+        if (sealedEmpty.Count() == 16) {
+            // Verify the known-answer tag (16 bytes for empty plaintext).
+            let want = new List<int>()
+            want.Add(83);  want.Add(15);  want.Add(138); want.Add(251)
+            want.Add(199); want.Add(69);  want.Add(54);  want.Add(185)
+            want.Add(169); want.Add(99);  want.Add(180); want.Add(241)
+            want.Add(196); want.Add(203); want.Add(115); want.Add(139)
+            var eq: bool = true
+            for k in 0..16 {
+                if (sealedEmpty.Get(k) != want.Get(k)) { eq = false }
+            }
+            if (eq) {
+                Console.WriteLine("[PASS] aead aes256gcm empty KAT")
+            } else {
+                Console.WriteLine("[FAIL] aead empty tag mismatch")
+            }
+        } else {
+            Console.WriteLine("[FAIL] aead empty wrong length: " + String_FromInt(sealedEmpty.Count()))
+        }
+
+        // ── Roundtrip: encrypt then decrypt ───────────
+        let pt: List<int> = new List<int>()
+        pt.Add(72)  // H
+        pt.Add(101) // e
+        pt.Add(108) // l
+        pt.Add(108) // l
+        pt.Add(111) // o
+        let aad: List<int> = new List<int>()
+        aad.Add(1); aad.Add(2); aad.Add(3)
+        let sealed: List<int> = Aead.SealAes256Gcm(zeroKey, zeroNonce, aad, pt)
+        if (sealed.Count() == 21) {     // 5 plaintext + 16 tag
+            Console.WriteLine("[PASS] aead sealed length")
+        } else {
+            Console.WriteLine("[FAIL] aead sealed length got " + String_FromInt(sealed.Count()))
+        }
+        let opened: AeadResult = Aead.OpenAes256Gcm(zeroKey, zeroNonce, aad, sealed)
+        if (opened.Ok
+            && opened.Plaintext.Count() == 5
+            && opened.Plaintext.Get(0) == 72
+            && opened.Plaintext.Get(4) == 111) {
+            Console.WriteLine("[PASS] aead roundtrip Hello")
+        } else {
+            Console.WriteLine("[FAIL] aead roundtrip lost data")
+        }
+
+        // ── Tag mismatch: corrupt a byte in the ciphertext ─
+        let tampered: List<int> = new List<int>()
+        for t in 0..sealed.Count() {
+            var b: int = sealed.Get(t)
+            if (t == 0) {
+                // Replace with (b+1) mod 256 — guaranteed to differ.
+                b = b + 1
+                if (b > 255) { b = 0 }
+            }
+            tampered.Add(b)
+        }
+        let badRes: AeadResult = Aead.OpenAes256Gcm(zeroKey, zeroNonce, aad, tampered)
+        if (!badRes.Ok) {
+            Console.WriteLine("[PASS] aead tag mismatch rejected")
+        } else {
+            Console.WriteLine("[FAIL] aead accepted tampered ct")
+        }
+
+        // ── Wrong AAD also fails the tag ─────────────
+        let wrongAad: List<int> = new List<int>()
+        wrongAad.Add(9); wrongAad.Add(9); wrongAad.Add(9)
+        let wrongAadRes: AeadResult = Aead.OpenAes256Gcm(zeroKey, zeroNonce, wrongAad, sealed)
+        if (!wrongAadRes.Ok) {
+            Console.WriteLine("[PASS] aead wrong-AAD rejected")
+        } else {
+            Console.WriteLine("[FAIL] aead accepted wrong AAD")
+        }
+
+        // ── v0.2.1: SealAes256GcmAuto round-trip ───────
+        // Auto bundles a fresh nonce inside the output, so this is
+        // the safe default — impossible to reuse a (key, nonce) pair.
+        let autoSealed: List<int> = Aead.SealAes256GcmAuto(zeroKey, aad, pt)
+        // 12 (nonce) + 5 (pt) + 16 (tag) = 33 bytes
+        if (autoSealed.Count() == 33) {
+            Console.WriteLine("[PASS] aead auto seal length")
+        } else {
+            Console.WriteLine("[FAIL] aead auto length: " + String_FromInt(autoSealed.Count()))
+        }
+
+        let autoOpened: AeadResult = Aead.OpenAes256GcmAuto(zeroKey, aad, autoSealed)
+        if (autoOpened.Ok
+            && autoOpened.Plaintext.Count() == 5
+            && autoOpened.Plaintext.Get(0) == 72) {
+            Console.WriteLine("[PASS] aead auto roundtrip")
+        } else {
+            Console.WriteLine("[FAIL] aead auto roundtrip lost data")
+        }
+
+        // Two Auto seals MUST differ (fresh nonce per call). If they
+        // were identical the underlying RAND_bytes would be broken.
+        let autoA: List<int> = Aead.SealAes256GcmAuto(zeroKey, aad, pt)
+        let autoB: List<int> = Aead.SealAes256GcmAuto(zeroKey, aad, pt)
+        var differ: bool = false
+        for k in 0..12 {
+            if (autoA.Get(k) != autoB.Get(k)) { differ = true }
+        }
+        if (differ) {
+            Console.WriteLine("[PASS] aead auto uses fresh nonce")
+        } else {
+            Console.WriteLine("[FAIL] aead auto reused nonce — RAND_bytes broken?")
+        }
+
+        // Tampered Auto bundle rejected.
+        let tamperedAuto: List<int> = new List<int>()
+        for tt in 0..autoSealed.Count() {
+            var bb: int = autoSealed.Get(tt)
+            if (tt == 13) {     // first ciphertext byte (after 12-byte nonce)
+                bb = bb + 1
+                if (bb > 255) { bb = 0 }
+            }
+            tamperedAuto.Add(bb)
+        }
+        let tampRes: AeadResult = Aead.OpenAes256GcmAuto(zeroKey, aad, tamperedAuto)
+        if (!tampRes.Ok) {
+            Console.WriteLine("[PASS] aead auto tamper rejected")
+        } else {
+            Console.WriteLine("[FAIL] aead auto tamper accepted")
+        }
+
+        // Too-short bundle rejected (< 28 bytes).
+        let shortBundle: List<int> = new List<int>()
+        for ss in 0..20 { shortBundle.Add(0) }
+        let shortRes: AeadResult = Aead.OpenAes256GcmAuto(zeroKey, aad, shortBundle)
+        if (!shortRes.Ok) {
+            Console.WriteLine("[PASS] aead auto short bundle rejected")
+        } else {
+            Console.WriteLine("[FAIL] aead auto accepted short bundle")
+        }
+
+        // ── Base64url round-trip (v0.3.0) ─────────────
+        // RFC 4648 §10 vectors, just URL-alphabet
+        // "" → ""; "f" → "Zg"; "fo" → "Zm8"; "foo" → "Zm9v"; "foob" → "Zm9vYg"
+        let v1: string = Bytes.ToBase64Url(Bytes.FromString(""))
+        let v2: string = Bytes.ToBase64Url(Bytes.FromString("f"))
+        let v3: string = Bytes.ToBase64Url(Bytes.FromString("fo"))
+        let v4: string = Bytes.ToBase64Url(Bytes.FromString("foo"))
+        let v5: string = Bytes.ToBase64Url(Bytes.FromString("foob"))
+        if (v1 == "" && v2 == "Zg" && v3 == "Zm8" && v4 == "Zm9v" && v5 == "Zm9vYg") {
+            Console.WriteLine("[PASS] base64url RFC 4648 vectors")
+        } else {
+            Console.WriteLine("[FAIL] base64url: " + v1 + "|" + v2 + "|" + v3 + "|" + v4 + "|" + v5)
+        }
+        // Round-trip a random-looking byte string
+        let payload: List<int> = Bytes.FromString("hello, world ?#$%^&*()_+-=")
+        let encoded: string = Bytes.ToBase64Url(payload)
+        let decoded: List<int> = Bytes.FromBase64Url(encoded)
+        let back: string = Bytes.ToString(decoded)
+        if (back == "hello, world ?#$%^&*()_+-=") {
+            Console.WriteLine("[PASS] base64url roundtrip")
+        } else {
+            Console.WriteLine("[FAIL] base64url roundtrip got: " + back)
+        }
+
+        // ── JwsKey ES256 generate + sign + verify ─────
+        let kE = JwsKey.GenerateEs256()
+        if (kE.IsValid() && kE.Algorithm() == "ES256") {
+            Console.WriteLine("[PASS] jws es256 generate")
+        } else {
+            Console.WriteLine("[FAIL] jws es256 generate: " + kE.Algorithm())
+        }
+
+        let msgE: List<int> = Bytes.FromString("hello JWS")
+        let sigE: List<int> = kE.Sign(msgE)
+        if (sigE.Count() == 64) {
+            Console.WriteLine("[PASS] jws es256 sig length 64")
+        } else {
+            Console.WriteLine("[FAIL] jws es256 sig length: " + String_FromInt(sigE.Count()))
+        }
+        if (kE.Verify(msgE, sigE)) {
+            Console.WriteLine("[PASS] jws es256 verify")
+        } else {
+            Console.WriteLine("[FAIL] jws es256 verify rejected own sig")
+        }
+        // Tampered message must fail
+        let msgEt: List<int> = Bytes.FromString("hello JWZ")
+        if (!kE.Verify(msgEt, sigE)) {
+            Console.WriteLine("[PASS] jws es256 tamper rejected")
+        } else {
+            Console.WriteLine("[FAIL] jws es256 accepted tampered msg")
+        }
+
+        // ── JWK + Thumbprint ─────────────────────────
+        let jwkE: string = kE.JwkPublic()
+        // Canonical order: crv, kty, x, y. Quick shape check.
+        if (String_StartsWith(jwkE, "{\"crv\":\"P-256\",\"kty\":\"EC\",\"x\":\"")
+            && String_Contains(jwkE, "\",\"y\":\"")
+            && String_EndsWith(jwkE, "\"}")) {
+            Console.WriteLine("[PASS] jws es256 jwk canonical shape")
+        } else {
+            Console.WriteLine("[FAIL] jws es256 jwk: " + jwkE)
+        }
+        let tp: string = kE.ThumbprintBase64Url()
+        // base64url(SHA-256(jwk)) is always 43 chars (256 / 6 = 42.67 → 43).
+        if (String_Length(tp) == 43) {
+            Console.WriteLine("[PASS] jws es256 thumbprint length 43")
+        } else {
+            Console.WriteLine("[FAIL] jws es256 thumbprint length: " + String_FromInt(String_Length(tp)))
+        }
+
+        // ── PEM round-trip ───────────────────────────
+        let pemE: string = kE.ToPemPrivate()
+        if (String_StartsWith(pemE, "-----BEGIN PRIVATE KEY-----")) {
+            Console.WriteLine("[PASS] jws es256 pem header")
+        } else {
+            Console.WriteLine("[FAIL] jws es256 pem header: " + pemE)
+        }
+        let kE2 = JwsKey.FromPemPrivate(pemE)
+        if (kE2.IsValid() && kE2.Algorithm() == "ES256") {
+            // Verify the loaded key produces same JWK (same public half)
+            if (kE2.JwkPublic() == jwkE) {
+                Console.WriteLine("[PASS] jws es256 pem roundtrip")
+            } else {
+                Console.WriteLine("[FAIL] jws es256 pem roundtrip jwk drift")
+            }
+        } else {
+            Console.WriteLine("[FAIL] jws es256 pem reload: " + kE2.Algorithm())
+        }
+
+        // ── RS256 quick smoke (genkey + sign + verify only) ──
+        // Skip the JWK-shape assertion for RSA — modulus length
+        // is fine but we don't pin specific bytes here.
+        let kR = JwsKey.GenerateRs256()
+        if (kR.IsValid() && kR.Algorithm() == "RS256") {
+            let msgR: List<int> = Bytes.FromString("rsa wins")
+            let sigR: List<int> = kR.Sign(msgR)
+            // RSA-2048 → 256-byte signature
+            if (sigR.Count() == 256 && kR.Verify(msgR, sigR)) {
+                Console.WriteLine("[PASS] jws rs256 sign+verify")
+            } else {
+                Console.WriteLine("[FAIL] jws rs256 sign+verify: len=" + String_FromInt(sigR.Count()))
+            }
+        } else {
+            Console.WriteLine("[FAIL] jws rs256 generate: " + kR.Algorithm())
+        }
+
+        // ── Password hashing (scrypt, v0.4.0) ────────────────
+        let pw: string = "correct horse battery staple"
+        let ph: string = Password.Hash(pw)
+        if (String_StartsWith(ph, "$scrypt$ln=15,r=8,p=1$")) {
+            Console.WriteLine("[PASS] password hash format")
+        } else {
+            Console.WriteLine("[FAIL] password hash format got '" + ph + "'")
+        }
+        if (Password.Verify(pw, ph)) {
+            Console.WriteLine("[PASS] password verify correct")
+        } else {
+            Console.WriteLine("[FAIL] password verify correct rejected")
+        }
+        if (!Password.Verify("wrong password", ph)) {
+            Console.WriteLine("[PASS] password verify wrong rejected")
+        } else {
+            Console.WriteLine("[FAIL] password verify wrong accepted")
+        }
+        // Same password hashed twice → different salt → different string.
+        let ph2: string = Password.Hash(pw)
+        if (ph != ph2) {
+            Console.WriteLine("[PASS] password salt randomized")
+        } else {
+            Console.WriteLine("[FAIL] password salt not randomized")
+        }
+        // The password still verifies against the second hash.
+        if (Password.Verify(pw, ph2)) {
+            Console.WriteLine("[PASS] password verify 2nd hash")
+        } else {
+            Console.WriteLine("[FAIL] password verify 2nd hash rejected")
+        }
+        // Malformed encoded string → false, no crash.
+        if (!Password.Verify(pw, "not-a-valid-hash")) {
+            Console.WriteLine("[PASS] password malformed rejected")
+        } else {
+            Console.WriteLine("[FAIL] password malformed accepted")
+        }
+
+        // ── Constant-time compare (G3) ───────────────────────
+        let ctA: List<int> = Bytes.FromString("super-secret-token")
+        let ctB: List<int> = Bytes.FromString("super-secret-token")
+        let ctC: List<int> = Bytes.FromString("super-secret-tokeX")
+        let ctD: List<int> = Bytes.FromString("short")
+        if (Bytes.ConstantTimeEquals(ctA, ctB)) {
+            Console.WriteLine("[PASS] ct-equals match")
+        } else {
+            Console.WriteLine("[FAIL] ct-equals match rejected")
+        }
+        if (!Bytes.ConstantTimeEquals(ctA, ctC)) {
+            Console.WriteLine("[PASS] ct-equals one-byte diff")
+        } else {
+            Console.WriteLine("[FAIL] ct-equals accepted a diff")
+        }
+        if (!Bytes.ConstantTimeEquals(ctA, ctD)) {
+            Console.WriteLine("[PASS] ct-equals length mismatch")
+        } else {
+            Console.WriteLine("[FAIL] ct-equals accepted length mismatch")
+        }
+
+        // ── Base32 + TOTP (RFC 6238 / RFC 4226) ──────────────────
+        // secret = ASCII "12345678901234567890" in base32
+        let tsec: string = "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ"
+        let tdec: List<int> = Base32.Decode(tsec)
+        if (tdec.Count() == 20 && tdec.Get(0) == 49 && tdec.Get(19) == 48) {
+            Console.WriteLine("[PASS] base32 decode (RFC 6238 secret)")
+        } else {
+            Console.WriteLine("[FAIL] base32 decode")
+        }
+        // RFC 6238 SHA-1 8-digit vectors
+        if (Totp.At(tsec, 59, 8, 30) == "94287082"
+            && Totp.At(tsec, 1111111109, 8, 30) == "07081804"
+            && Totp.At(tsec, 1234567890, 8, 30) == "89005924") {
+            Console.WriteLine("[PASS] totp rfc6238 8-digit vectors")
+        } else {
+            Console.WriteLine("[FAIL] totp vectors: " + Totp.At(tsec, 59, 8, 30))
+        }
+        if (Totp.At(tsec, 59, 6, 30) == "287082") {
+            Console.WriteLine("[PASS] totp 6-digit (287082)")
+        } else {
+            Console.WriteLine("[FAIL] totp 6-digit: " + Totp.At(tsec, 59, 6, 30))
+        }
+        let tnow: string = Totp.Now(tsec, 6, 30)
+        if (Totp.Verify(tsec, tnow, 6, 30, 1) && !Totp.Verify(tsec, "000000", 6, 30, 1)) {
+            Console.WriteLine("[PASS] totp verify (current ok, 000000 rejected)")
+        } else {
+            Console.WriteLine("[FAIL] totp verify")
+        }
+
+        // ── FromJwkRsa: import a public key from JWK n/e (OIDC) ──
+        // Round-trip: generate RS256, export its public JWK, re-import
+        // the modulus+exponent, and confirm the imported (verify-only)
+        // key validates a signature the private half produced — the
+        // exact path an OIDC id_token check walks against a live JWKS.
+        let jwk: string = kR.JwkPublic()
+        let nVal: string = Program.jsonField(jwk, "n")
+        let eVal: string = Program.jsonField(jwk, "e")
+        let pub: JwsKey = JwsKey.FromJwkRsa(Bytes.FromBase64Url(nVal), Bytes.FromBase64Url(eVal))
+        let msgJ: List<int> = Bytes.FromString("oidc id_token signing input")
+        let sigJ: List<int> = kR.Sign(msgJ)
+        if (pub.IsValid() && pub.Algorithm() == "RS256" && pub.Verify(msgJ, sigJ)) {
+            Console.WriteLine("[PASS] jws FromJwkRsa import + verify")
+        } else {
+            Console.WriteLine("[FAIL] jws FromJwkRsa import + verify")
+        }
+        // A tampered signing input must NOT verify under the imported key.
+        let msgBad: List<int> = Bytes.FromString("oidc id_token signing inpuX")
+        if (!pub.Verify(msgBad, sigJ)) {
+            Console.WriteLine("[PASS] jws FromJwkRsa rejects tampered input")
+        } else {
+            Console.WriteLine("[FAIL] jws FromJwkRsa accepted tampered input")
+        }
+        // A garbage / undersized modulus → Handle 0, never a usable key.
+        let bogus: JwsKey = JwsKey.FromJwkRsa(Bytes.FromString("short"), Bytes.FromString("AQAB"))
+        if (!bogus.IsValid()) {
+            Console.WriteLine("[PASS] jws FromJwkRsa rejects bogus modulus")
+        } else {
+            Console.WriteLine("[FAIL] jws FromJwkRsa accepted bogus modulus")
+        }
+
+        // ── FromCoseEc2 + SignDer/VerifyDer (WebAuthn assertion) ──
+        // Round-trip: generate ES256, sign in NATIVE DER, export the
+        // public EC coords (JWK x/y), re-import via FromCoseEc2, and
+        // confirm the imported verify-only key validates the DER sig —
+        // exactly how a WebAuthn relying party checks an assertion.
+        let ecJwk: string = kE2.JwkPublic()
+        let xVal: string = Program.jsonField(ecJwk, "x")
+        let yVal: string = Program.jsonField(ecJwk, "y")
+        let pubEc: JwsKey = JwsKey.FromCoseEc2(
+            Bytes.FromBase64Url(xVal), Bytes.FromBase64Url(yVal))
+        let msgWA: List<int> = Bytes.FromString("webauthn assertion signing input")
+        let derSig: List<int> = kE2.SignDer(msgWA)
+        if (pubEc.IsValid() && pubEc.Algorithm() == "ES256"
+            && derSig.Count() > 0 && pubEc.VerifyDer(msgWA, derSig)) {
+            Console.WriteLine("[PASS] jws FromCoseEc2 + VerifyDer round-trip")
+        } else {
+            Console.WriteLine("[FAIL] jws FromCoseEc2 + VerifyDer round-trip")
+        }
+        // A tampered message must NOT verify under the imported EC key.
+        let msgWAbad: List<int> = Bytes.FromString("webauthn assertion signing inpuX")
+        if (!pubEc.VerifyDer(msgWAbad, derSig)) {
+            Console.WriteLine("[PASS] jws VerifyDer rejects tampered assertion")
+        } else {
+            Console.WriteLine("[FAIL] jws VerifyDer accepted tampered assertion")
+        }
+
+        // ── v0.8.0: ECDH P-256 + AES-128-GCM (Web Push) ──
+        let ea: Ecdh = Ecdh.GenerateP256()
+        let eb: Ecdh = Ecdh.GenerateP256()
+        let eaPub: List<int> = ea.PublicRaw()
+        let ebPub: List<int> = eb.PublicRaw()
+        if (eaPub.Count() == 65 && ebPub.Count() == 65) {
+            Console.WriteLine("[PASS] ecdh public raw is 65 bytes")
+        } else {
+            Console.WriteLine("[FAIL] ecdh public len " + String_FromInt(eaPub.Count()) + "/" + String_FromInt(ebPub.Count()))
+        }
+        // ECDH(a_priv, b_pub) MUST equal ECDH(b_priv, a_pub).
+        let es1: List<int> = ea.Derive(ebPub)
+        let es2: List<int> = eb.Derive(eaPub)
+        var ecdhOk: bool = es1.Count() == 32 && es2.Count() == 32
+        if (ecdhOk) {
+            for i in 0..32 { if (es1.Get(i) != es2.Get(i)) { ecdhOk = false } }
+        }
+        if (ecdhOk) {
+            Console.WriteLine("[PASS] ecdh shared secret matches both ways (32 bytes)")
+        } else {
+            Console.WriteLine("[FAIL] ecdh shared secret mismatch (" + String_FromInt(es1.Count()) + "/" + String_FromInt(es2.Count()) + ")")
+        }
+        // AES-128-GCM seal: output length = plaintext + 16-byte tag.
+        let ak: List<int> = new List<int>()
+        for i in 0..16 { ak.Add(i + 1) }
+        let an: List<int> = new List<int>()
+        for i in 0..12 { an.Add(i) }
+        let apt: List<int> = Bytes.FromString("hello webpush")
+        let act: List<int> = Aead.SealAes128Gcm(ak, an, new List<int>(), apt)
+        if (act.Count() == apt.Count() + 16) {
+            Console.WriteLine("[PASS] aes128gcm seal length = pt + 16")
+        } else {
+            Console.WriteLine("[FAIL] aes128gcm seal len " + String_FromInt(act.Count()))
+        }
+    }
+
+    // Minimal extractor for a canonical JSON string field `"key":"value"`
+    // — enough for the canonical JWK shape the test exports (no escapes).
+    static string jsonField(json: string, key: string) {
+        let needle: string = "\"" + key + "\":\""
+        let i: int = String_IndexOf(json, needle)
+        if (i < 0) { return "" }
+        let start: int = i + String_Length(needle)
+        let rest: string = String_Substring(json, start, String_Length(json) - start)
+        let end: int = String_IndexOf(rest, "\"")
+        if (end < 0) { return rest }
+        return String_Substring(rest, 0, end)
+    }
+}

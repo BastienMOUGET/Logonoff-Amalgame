@@ -1,0 +1,126 @@
+// Stdlib test: Amalgame.Service — long-running process primitives.
+//
+// We can't deliver SIGTERM to the test runner's own process during
+// the suite (it would kill the runner mid-suite). Instead we drive
+// the same code paths via `Service.RequestStop()`, the programmatic
+// shutdown hook documented for in-process triggers.
+
+namespace Tests
+
+import Amalgame.Service
+
+public class Program {
+    public static void Main(string[] args) {
+
+        // Initial state: nothing has triggered shutdown yet.
+        let before: bool = Service.ShouldStop()
+        if (!before) {
+            Console.WriteLine("[PASS] not stopping at start")
+        } else {
+            Console.WriteLine("[FAIL] not stopping at start")
+        }
+
+        // Install the signal handler. Should be a no-op for repeated
+        // calls (the OS replaces the existing handler).
+        Service.Install()
+        Service.Install()
+        Console.WriteLine("[PASS] install idempotent")
+
+        // RunAsService is the v0.2.0 entry point. On POSIX it's
+        // identical to Install() (still a no-op when chained). On
+        // Windows it additionally bootstraps the SCM dispatcher on
+        // a worker thread; in console mode (which this test runs in)
+        // StartServiceCtrlDispatcher returns immediately with
+        // ERROR_FAILED_SERVICE_CONTROLLER_CONNECT and the binary
+        // keeps behaving like a plain console daemon. We assert the
+        // call returns cleanly and that subsequent ShouldStop/Sleep
+        // still work as expected.
+        Service.RunAsService("amalgame-service-test")
+        Service.RunAsService("amalgame-service-test")
+        Console.WriteLine("[PASS] run-as-service idempotent")
+
+        // v0.3.0 event queue. Real session events need the SCM, so
+        // drive the queue through InjectEvent — same ring buffer.
+        Service.EnableSessionEvents()
+        let empty: List<ServiceEvent> = Service.PollEvents()
+        if (empty.Count() == 0) {
+            Console.WriteLine("[PASS] poll empty at start")
+        } else {
+            Console.WriteLine("[FAIL] poll empty at start")
+        }
+
+        Service.InjectEvent("Lock", 3)
+        Service.InjectEvent("Unlock", 3)
+        Service.InjectEvent("NotAKind", 3)
+        Service.InjectEvent("Suspend", -1)
+        let evs: List<ServiceEvent> = Service.PollEvents()
+        let e0: ServiceEvent = evs.Get(0)
+        let e1: ServiceEvent = evs.Get(1)
+        let e2: ServiceEvent = evs.Get(2)
+        if (evs.Count() == 3 && e0.Kind == "Lock" && e0.SessionId == 3
+            && e1.Kind == "Unlock" && e2.Kind == "Suspend" && e2.SessionId == -1
+            && e0.TimeNanos > 0 && e2.TimeNanos >= e0.TimeNanos) {
+            Console.WriteLine("[PASS] inject + poll in order")
+        } else {
+            Console.WriteLine("[FAIL] inject + poll in order")
+        }
+
+        let again: List<ServiceEvent> = Service.PollEvents()
+        if (again.Count() == 0) {
+            Console.WriteLine("[PASS] poll drains queue")
+        } else {
+            Console.WriteLine("[FAIL] poll drains queue")
+        }
+
+        for i in 0..300 {
+            Service.InjectEvent("Logon", i)
+        }
+        let flood: List<ServiceEvent> = Service.PollEvents()
+        let first: ServiceEvent = flood.Get(0)
+        let last: ServiceEvent = flood.Get(255)
+        if (flood.Count() == 256 && first.SessionId == 44 && last.SessionId == 299) {
+            Console.WriteLine("[PASS] overflow drops oldest")
+        } else {
+            Console.WriteLine("[FAIL] overflow drops oldest")
+        }
+
+        if (Service.EventKindName(Service.EventKindCode("Resume")) == "Resume"
+            && Service.EventKindCode("bogus") == 0 && Service.EventKindName(99) == "Unknown") {
+            Console.WriteLine("[PASS] kind name/code round-trip")
+        } else {
+            Console.WriteLine("[FAIL] kind name/code round-trip")
+        }
+
+        // Windows-only helpers degrade to empty values elsewhere (and
+        // in console mode on Windows for the LocalSystem ones).
+        if (!Service.IsRunningUnderScm()) {
+            Console.WriteLine("[PASS] not under scm")
+        } else {
+            Console.WriteLine("[FAIL] not under scm")
+        }
+        let st: string = Service.SessionState(999999)
+        let lk: string = Service.SessionLockState(999999)
+        if (st == "Unknown" && lk == "Unknown" && Service.SessionUserSid(999999) == ""
+            && Service.LaunchInSession(999999, "x") == 0) {
+            Console.WriteLine("[PASS] session helpers on missing session")
+        } else {
+            Console.WriteLine("[FAIL] session helpers on missing session")
+        }
+
+        // Programmatic shutdown trigger. Same flag the signal handler
+        // would flip — drives the rest of the test from in-process.
+        Service.RequestStop()
+        let after: bool = Service.ShouldStop()
+        if (after) {
+            Console.WriteLine("[PASS] should-stop after request")
+        } else {
+            Console.WriteLine("[FAIL] should-stop after request")
+        }
+
+        // Sleep with the flag already set returns immediately. We
+        // ask for 5s; if the implementation honours the flag, the
+        // call returns in well under a second.
+        Service.Sleep(5000)
+        Console.WriteLine("[PASS] sleep short-circuits when stopping")
+    }
+}

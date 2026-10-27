@@ -1,0 +1,6 @@
+# Keep the vendored SQLite amalgamation out of GitHub's language
+# stats — without this the repo shows up as ~99% C because of
+# 9MB of upstream sqlite3.c. With this annotation, the language
+# bar reflects only the Amalgame-binding code we wrote.
+runtime/Amalgame_Database/sqlite/sqlite3.c linguist-vendored=true
+runtime/Amalgame_Database/sqlite/sqlite3.h linguist-vendored=true

@@ -1,0 +1,268 @@
+// amalgame-net-http — HttpRequest (parsed request).
+//
+// Lives in its own file since v0.4.6 split (was in facade.am
+// v0.4.5 and earlier). No behavior change vs the previous combined
+// file — just locality.
+
+namespace Amalgame.Net.Http
+
+import Amalgame.Collections
+import Amalgame.String
+
+// ─────────────────────────────────────────────────────────────────
+// HttpRequest — one incoming HTTP request after parsing.
+// ─────────────────────────────────────────────────────────────────
+
+public class HttpRequest {
+    public Method:      string                    // "GET" / "POST" / ...
+    public Path:        string                    // "/users/42" (no query)
+    public RawTarget:   string                    // "/users/42?x=1" (with query)
+    public HttpVersion: string                    // "HTTP/1.1" or "HTTP/2"
+    public Headers:     Map<string, string>       // header name lowercased → value
+    public Query:       Map<string, string>       // parsed query string
+    public Body:        string                    // raw body bytes (text-safe)
+    public RemoteAddr:  string                    // client IP:port
+    public IsSecure:    bool                      // true if served over TLS
+    // v0.14.1: raw body buffer (pointer-as-i64 + length). Stashed by
+    // FromH1Conn so the multipart parser can walk binary bytes that
+    // `Body` (a NUL-truncating code_string) would lose. 0 / 0 when the
+    // request came from a non-H1 path (then the parser falls back to
+    // `Body`, fine for text/ASCII multipart).
+    public BodyPtr:     int
+    public BodyLen:     int
+    // v0.28.0: when the body was spooled to a temp file (large uploads,
+    // see Http1.SetBodySpoolThreshold), this is its path and `Body` is "".
+    // The handler owns the file — move it into place or delete it. "" when
+    // the body is in RAM at `Body`.
+    public BodyFile:    string
+    // v0.29.4: octets lus au-delà des en-têtes d'une requête SANS
+    // Content-Length — un flux d'encodeur (ingest audio sans fin) est
+    // exactement ce cas. Ils étaient jetés en silence, et le premier
+    // fragment du flux disparaissait à chaque connexion. À consommer
+    // AVANT de lire sur le fd brut, sinon le flux commence au mauvais
+    // endroit. 0 / 0 quand la requête avait un Content-Length (ces
+    // octets-là sont dans Body) ou qu'il n'y avait rien de plus à lire.
+    public PendingPtr:  int
+    public PendingLen:  int
+
+    public HttpRequest() {
+        this.Method      = ""
+        this.Path        = ""
+        this.RawTarget   = ""
+        this.HttpVersion = ""
+        this.Headers     = new Map<string, string>()
+        this.Query       = new Map<string, string>()
+        this.Body        = ""
+        this.RemoteAddr  = ""
+        this.IsSecure    = false
+        this.BodyPtr     = 0
+        this.BodyLen     = 0
+        this.BodyFile    = ""
+        this.PendingPtr  = 0
+        this.PendingLen  = 0
+    }
+
+    // Get a header value (case-insensitive lookup).
+    public string Header(string name) {
+        let key: string = String_ToLower(name)
+        if (this.Headers.Has(key)) { return this.Headers.Get(key) }
+        return ""
+    }
+
+    // Parse Body as a urlencoded form (Content-Type application/x-www-form-urlencoded).
+    public Map<string, string> Form() {
+        return HttpRequest.ParseQuery(this.Body)
+    }
+
+    // v0.14.1: true when the request carries a multipart/form-data body
+    // (file uploads). Parse it with `Multipart.Parse(req)`.
+    public bool IsMultipart() {
+        return String_StartsWith(String_ToLower(this.Header("content-type")), "multipart/form-data")
+    }
+
+    // Body as plain text (already a string in v0.1).
+    public string BodyText() { return this.Body }
+
+    // Extract a cookie value by name from the Cookie: header.
+    public string Cookie(string name) {
+        let raw: string = this.Header("cookie")
+        if (String_Length(raw) == 0) { return "" }
+        let parts: List<string> = String_Split(raw, ";")
+        let pn: int = parts.Count()
+        for i in 0..pn {
+            let p: string = String_Trim(parts.Get(i))
+            let eq: int = String_IndexOf(p, "=")
+            if (eq < 0) { continue }
+            let k: string = String_Substring(p, 0, eq)
+            if (k == name) {
+                return String_Substring(p, eq + 1, String_Length(p) - eq - 1)
+            }
+        }
+        return ""
+    }
+
+    // ── Internal parser helpers ────────────────────────────────────
+
+    // Parse a urlencoded key=value&... string into a map.
+    public static Map<string, string> ParseQuery(string s) {
+        let out = new Map<string, string>()
+        if (String_Length(s) == 0) { return out }
+        let pairs: List<string> = String_Split(s, "&")
+        let pn: int = pairs.Count()
+        for i in 0..pn {
+            let p: string = pairs.Get(i)
+            if (String_Length(p) == 0) { continue }
+            let eq: int = String_IndexOf(p, "=")
+            if (eq < 0) {
+                out.Set(HttpRequest.UrlDecode(p), "")
+            } else {
+                let k: string = String_Substring(p, 0, eq)
+                let v: string = String_Substring(p, eq + 1, String_Length(p) - eq - 1)
+                out.Set(HttpRequest.UrlDecode(k), HttpRequest.UrlDecode(v))
+            }
+        }
+        return out
+    }
+
+    // Minimal urldecode: %HH escapes + '+' → space. Invalid sequences
+    // pass through unchanged. Uses String_CharAt1 (returns single-char
+    // string) — the AM convention. Hex digits are compared as strings
+    // since we don't have a string→int codepoint helper at AM level.
+    public static string UrlDecode(string s) {
+        var out: string = ""
+        let n: int = String_Length(s)
+        var i: int = 0
+        while (i < n) {
+            let c: string = String_CharAt1(s, i)
+            if (c == "%" && i + 2 < n) {
+                let h1: int = HttpRequest.HexDigit(String_CharAt1(s, i + 1))
+                let h2: int = HttpRequest.HexDigit(String_CharAt1(s, i + 2))
+                if (h1 >= 0 && h2 >= 0) {
+                    out = out + String_FromByte(h1 * 16 + h2)
+                    i = i + 3
+                    continue
+                }
+            }
+            if (c == "+") {
+                out = out + " "
+            } else {
+                out = out + c
+            }
+            i = i + 1
+        }
+        return out
+    }
+
+    // Decode a single hex digit char ("0"-"9","a"-"f","A"-"F") → 0-15,
+    // -1 if not a hex digit.
+    private static int HexDigit(string c) {
+        if (c == "0") { return 0 }
+        if (c == "1") { return 1 }
+        if (c == "2") { return 2 }
+        if (c == "3") { return 3 }
+        if (c == "4") { return 4 }
+        if (c == "5") { return 5 }
+        if (c == "6") { return 6 }
+        if (c == "7") { return 7 }
+        if (c == "8") { return 8 }
+        if (c == "9") { return 9 }
+        if (c == "a" || c == "A") { return 10 }
+        if (c == "b" || c == "B") { return 11 }
+        if (c == "c" || c == "C") { return 12 }
+        if (c == "d" || c == "D") { return 13 }
+        if (c == "e" || c == "E") { return 14 }
+        if (c == "f" || c == "F") { return 15 }
+        return -1
+    }
+
+    // ── v0.7.0: Bridge from H1Conn ─────────────────
+    //
+    // Build a parsed HttpRequest from a live H1Conn (the connection
+    // object passed to handlers by Http1.Serve / ServeMt / ServeWith
+    // / ServeMtWith). Bundles every getter the parser exposes —
+    // Method / Path / RawTarget / Body / RemoteAddr.
+    //
+    // v0.13.6: all request headers are now copied into req.Headers
+    // (lowercased keys), so handlers/middlewares read Host / Cookie /
+    // Authorization / … directly. H1Conn.Header(conn, name) still
+    // works for one-off lookups.
+    //
+    // RemoteAddr (e.g. "192.0.2.1:54321") populated from the
+    // accepted socket's peer name where the parser tracks it.
+    //
+    // Lives in HttpRequest (not H1Conn) so it can be reached
+    // through --external facade.am — amalgame-web's WebApp.Serve*
+    // entry points use it without having to depend on H1Conn being
+    // exposed in the consumer's namespace.
+    //
+    // The `conn` is passed as `int` (a pointer-as-i64 handle) to
+    // sidestep amc's self-build limitation: when net-http compiles
+    // its own facade, `AmalgameH1Conn` is treated as a Local class
+    // (manifest entry) and mangled into the consumer namespace,
+    // breaking the C-level type match. Passing it as i64 + casting
+    // inside the @c block routes around that. Callers just pass
+    // their H1Conn straight (amc auto-converts the pointer).
+    public static HttpRequest FromH1Conn(conn: int) {
+        let req = new HttpRequest()
+        @c {
+            AmalgameH1Conn* c = (AmalgameH1Conn*)(uintptr_t) conn;
+            if (c) {
+                req->Method      = (code_string) Amalgame_Net_Http_H1Conn_Method(c);
+                req->Path        = (code_string) Amalgame_Net_Http_H1Conn_Path(c);
+                req->RawTarget   = (code_string) Amalgame_Net_Http_H1Conn_RawTarget(c);
+                req->HttpVersion = "HTTP/1.1";
+                req->Body        = (code_string) Amalgame_Net_Http_H1Conn_Body(c);
+                /* v0.14.1: stash the raw body buffer so the multipart
+                 * parser can walk binary bytes (Body truncates at NUL). */
+                req->BodyPtr     = (i64)(uintptr_t) c->body;
+                req->BodyLen     = (i64) c->body_len;
+                /* v0.28.0: large body spooled to a temp file (empty
+                 * otherwise). The handler renames/deletes it. */
+                req->BodyFile    = (code_string) Amalgame_Net_Http_H1Conn_BodyFile(c);
+                req->PendingPtr  = Amalgame_Net_Http_H1Conn_Pending(c);
+                req->PendingLen  = Amalgame_Net_Http_H1Conn_PendingLen(c);
+                /* RemoteAddr captured at accept time, formatted
+                 * "ip:port". If missing on older builds the field
+                 * stays empty and RateLimit "ip" strategy falls
+                 * back to allow. */
+                if (c->remote_addr[0]) {
+                    req->RemoteAddr = (code_string) c->remote_addr;
+                }
+                /* v0.13.6: copy every request header into req->Headers
+                 * (names already lowercased by the parser), so handlers
+                 * and middlewares on the live H1 path can read Host /
+                 * Cookie / Authorization / Content-Type / … — previously
+                 * this map was left empty and only H1Conn.Header(conn,
+                 * name) could reach a header. */
+                for (int hi = 0; hi < c->header_count; hi++) {
+                    AmalgameMap_set((AmalgameMap*) req->Headers,
+                                    (code_string) c->headers[hi].name,
+                                    (void*) c->headers[hi].value);
+                }
+            }
+        }
+        // v0.9.7: parse the query string off RawTarget. The HTTP/1.1
+        // wire path (FromH1Conn) used to leave `req.Query` as the
+        // empty Map from the constructor — only ParseHeaders (the
+        // legacy text-based parser) populated it. Handlers calling
+        // `req.Query.Has("since")` on a live H1 server got false
+        // for any param. Fixed by mirroring ParseHeaders' split on
+        // the first `?` in RawTarget.
+        let qIdx: int = String_IndexOf(req.RawTarget, "?")
+        if (qIdx >= 0) {
+            let q: string = String_Substring(req.RawTarget, qIdx + 1,
+                                              String_Length(req.RawTarget) - qIdx - 1)
+            req.Query = HttpRequest.ParseQuery(q)
+        }
+        // v0.12.2: percent-decode the path. The wire path is
+        // percent-encoded (e.g. "/%C3%A0-propos" for "/à-propos",
+        // "/a%20b.png" for "/a b.png"). Routing + static file lookup
+        // need the decoded form to match real route patterns and
+        // filenames on disk. Query already decodes per-param above;
+        // Path was previously left raw, so non-ASCII / spaced URLs
+        // 404'd against static mounts and catch-all routes.
+        req.Path = HttpRequest.UrlDecode(req.Path)
+        return req
+    }
+}
+

@@ -1,0 +1,18 @@
+# Build artefacts — none expected at the repo root, but keep
+# this stub so contributors don't accidentally commit test
+# scaffolding from their local hacking.
+*.o
+*.a
+*.so
+*.dylib
+*.dll
+
+# Amalgame intermediate output
+*.c.tmp
+gen_test.c
+gen_test
+
+# Editor cruft
+.DS_Store
+.vscode/
+.idea/

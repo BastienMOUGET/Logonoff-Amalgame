@@ -1,0 +1,63 @@
+# Package manifest — amc reads this at `amc add` time to learn
+# what symbols this package contributes + how to compile against
+# them. See docs/proposals/amalgame-package-manager.md in
+# amalgame-lang/Amalgame for the full spec.
+
+[package]
+name              = "amalgame-database-sqlite"
+version           = "0.4.0"
+license           = "Apache-2.0"
+description       = "SQLite 3 binding for Amalgame — vendored amalgamation. v0.4 adds parameter binding (ExecBind / QueryBindAll) and transactions (Begin / Commit / Rollback)."
+authors           = ["Bastien Mouget"]
+required-amalgame = ">=0.8.40"
+schema-version    = 1
+
+[stdlib]
+class     = "SQLite"
+header    = "runtime/Amalgame_Database_SQLite.h"
+namespace = "Amalgame.Database.SQLite"
+
+# Vendored .c sources that user binaries link alongside the
+# generated .c. The package manager builds them once per cache
+# directory and reuses the resulting .o on every compile.
+sources    = ["runtime/Amalgame_Database/sqlite/sqlite3.c"]
+
+# Precompile at install time (amc >= 0.5.4): the gcc pass runs
+# once during `amc package add sqlite@vX.Y.Z`, output cached at
+# `~/.amalgame/packages/.../build/<platform>/SQLite-sqlite3.c.o`.
+# Subsequent `amc test` / `amc build` reuse the .o instantly.
+# Override with `amc package add sqlite@vX.Y.Z --no-precompile`.
+precompile = true
+
+# Per-source compile flags. SQLite's amalgamation has internal
+# warnings we don't want to surface (amc adds -w under the hood
+# already, but explicit defaults travel better when a downstream
+# picks the flags up manually). FTS5 is enabled for parity with
+# the v0.2.0 build expectations.
+cflags     = "-DSQLITE_THREADSAFE=1 -DSQLITE_ENABLE_FTS5"
+
+# Surface the amc cgen needs to know about. `returns` is the
+# C-level type (with `*` for pointer types); amc strips the `*`
+# when declaring the symbol's Amalgame-side type to the resolver.
+[stdlib.functions]
+Open          = { returns = "AmalgameSQLite*" }
+Close         = { returns = "void" }
+IsOpen        = { returns = "code_bool" }
+LastError     = { returns = "code_string" }
+Exec          = { returns = "code_bool" }
+# `returns_generic` (amc 0.8.40+) lets `let row = rows.Get(i)`
+# infer to `List<string>` and `row.Get(j)` to `string` without
+# explicit annotations on the consumer side.
+QueryAll      = { returns = "AmalgameList*", returns_generic = "List<List<string>>" }
+LastInsertId  = { returns = "i64" }
+Changes       = { returns = "i64" }
+# v2 (0.4.0): parameter binding via `?` positional placeholders +
+# transaction primitives.
+ExecBind      = { returns = "code_bool" }
+QueryBindAll  = { returns = "AmalgameList*", returns_generic = "List<List<string>>" }
+Begin         = { returns = "code_bool" }
+Commit        = { returns = "code_bool" }
+Rollback      = { returns = "code_bool" }
+
+[dependencies]
+# none — SQLite is a leaf in the dep graph

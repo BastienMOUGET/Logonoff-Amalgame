@@ -1,0 +1,27 @@
+# Package manifest — amalgame-service
+#
+# Pure-Amalgame service facade — SIGTERM/SIGINT signal handler +
+# ShouldStop polling + interruptible Sleep, the three primitives
+# every long-running daemon needs. Originally bundled in amc's
+# src/stdlib/service.am; extracted into this external package
+# as part of the framework split.
+#
+# Installation:
+#
+#   amc package add service                  # via curated index
+#   amc package add github.com/amalgame-lang/amalgame-service@v0.3.0
+
+[package]
+name              = "amalgame-service"
+version           = "0.3.0"
+license           = "Apache-2.0"
+description       = "Pure-Amalgame service facade: signal handler + ShouldStop + interruptible Sleep + native Windows SCM dispatcher + session/power events and Windows session helpers (user, SID, lock state, admin check, SendMessage, LaunchInSession)."
+authors           = ["Bastien Mouget"]
+required-amalgame = ">=0.7.7"
+schema-version    = 1
+
+[stdlib]
+class     = "Service"
+header    = "facade-stub.h"
+namespace = "Amalgame.Service"
+facade    = "facade.am"

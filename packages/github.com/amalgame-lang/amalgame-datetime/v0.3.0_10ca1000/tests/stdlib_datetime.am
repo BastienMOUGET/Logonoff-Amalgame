@@ -1,0 +1,266 @@
+// Test sample for amalgame-datetime — Instant / Duration /
+// Stopwatch + ISO 8601 round-trip.
+//
+// Avoid the bare keyword "ns"+"pace" in comments.
+
+namespace UserApp
+
+import Amalgame.DateTime
+
+public class Program {
+    public static void Main() {
+
+        // ── Instant.Now produces a non-trivial value ──
+        let now: Instant = Instant.Now()
+        let nowS: int = now.UnixSeconds()
+        // Anything after Jan 1 2020 (= 1577836800s) is plausible.
+        if (nowS > 1577836800) {
+            Console.WriteLine("[PASS] Now plausible")
+        } else {
+            Console.WriteLine("[FAIL] Now plausible")
+        }
+
+        // ── FromUnixSeconds + accessors ───────────────
+        let i1: Instant = Instant.FromUnixSeconds(1700000000)
+        let s1: int = i1.UnixSeconds()
+        let m1: int = i1.UnixMillis()
+        let n1: int = i1.UnixNanos()
+        let okFrom: bool = (s1 == 1700000000) && (m1 == 1700000000000) && (n1 == 1700000000000000000)
+        if (okFrom) {
+            Console.WriteLine("[PASS] FromUnixSeconds")
+        } else {
+            Console.WriteLine("[FAIL] FromUnixSeconds")
+        }
+
+        // ── ISO 8601 round-trip ───────────────────────
+        let iso1: string = "2026-05-09T22:30:00.000000000Z"
+        let r1: InstantResult = Instant.Parse(iso1)
+        if (r1.IsOk()) {
+            let v: Instant = r1.GetValue()
+            let formatted: string = v.Format()
+            if (formatted == iso1) {
+                Console.WriteLine("[PASS] iso round trip")
+            } else {
+                Console.WriteLine("[FAIL] iso round trip got: " + formatted)
+            }
+        } else {
+            Console.WriteLine("[FAIL] iso round trip parse failed")
+        }
+
+        // ── Parse with fractional seconds (truncates >9) ──
+        let iso2: string = "2026-01-15T08:00:00.123456Z"
+        let r2: InstantResult = Instant.Parse(iso2)
+        if (r2.IsOk()) {
+            let v2: Instant = r2.GetValue()
+            let n2: int = v2.UnixNanos()
+            // 2026-01-15T08:00:00Z = 1768464000 unix seconds.
+            // + 0.123456 fractional → 123_456_000 ns.
+            let want: int = 1768464000000000000 + 123456000
+            if (n2 == want) {
+                Console.WriteLine("[PASS] iso fractional")
+            } else {
+                Console.WriteLine("[FAIL] iso fractional got: " + String_FromInt(n2))
+            }
+        } else {
+            Console.WriteLine("[FAIL] iso fractional parse failed")
+        }
+
+        // ── Parse rejects non-UTC offsets ─────────────
+        let bad1: InstantResult = Instant.Parse("2026-05-09T22:30:00+02:00")
+        let bad2: InstantResult = Instant.Parse("not a date")
+        let bad3: InstantResult = Instant.Parse("2026-05-09")
+        if (!bad1.IsOk() && !bad2.IsOk() && !bad3.IsOk()) {
+            Console.WriteLine("[PASS] parse rejects bad")
+        } else {
+            Console.WriteLine("[FAIL] parse rejects bad")
+        }
+
+        // ── Instant arithmetic (Add / Subtract / Since) ──
+        let base: Instant = Instant.FromUnixSeconds(1700000000)
+        let plusHour: Duration = Duration.FromHours(1)
+        let later: Instant = base.Add(plusHour)
+        let laterS: int = later.UnixSeconds()
+        if (laterS == 1700003600) {
+            Console.WriteLine("[PASS] Instant.Add hours")
+        } else {
+            Console.WriteLine("[FAIL] Instant.Add hours")
+        }
+        let earlier: Instant = base.Subtract(plusHour)
+        let earlierS: int = earlier.UnixSeconds()
+        if (earlierS == 1699996400) {
+            Console.WriteLine("[PASS] Instant.Subtract hours")
+        } else {
+            Console.WriteLine("[FAIL] Instant.Subtract hours")
+        }
+        let diff: Duration = later.Since(base)
+        let diffSec: int = diff.Seconds()
+        if (diffSec == 3600) {
+            Console.WriteLine("[PASS] Instant.Since")
+        } else {
+            Console.WriteLine("[FAIL] Instant.Since")
+        }
+
+        // ── HTTP date (RFC 1123) ───────────────────────
+        if (DateTime.FormatHttpDate(0) == "Thu, 01 Jan 1970 00:00:00 GMT") {
+            Console.WriteLine("[PASS] FormatHttpDate epoch")
+        } else {
+            Console.WriteLine("[FAIL] FormatHttpDate epoch got: " + DateTime.FormatHttpDate(0))
+        }
+        if (DateTime.FormatHttpDate(1735689600) == "Wed, 01 Jan 2025 00:00:00 GMT") {
+            Console.WriteLine("[PASS] FormatHttpDate 2025")
+        } else {
+            Console.WriteLine("[FAIL] FormatHttpDate 2025 got: " + DateTime.FormatHttpDate(1735689600))
+        }
+        let httpRt: int = DateTime.ParseHttpDate("Wed, 01 Jan 2025 00:00:00 GMT")
+        if (httpRt == 1735689600) {
+            Console.WriteLine("[PASS] ParseHttpDate")
+        } else {
+            Console.WriteLine("[FAIL] ParseHttpDate got: " + String_FromInt(httpRt))
+        }
+        if (DateTime.ParseHttpDate("garbage") == -1) {
+            Console.WriteLine("[PASS] ParseHttpDate rejects bad")
+        } else {
+            Console.WriteLine("[FAIL] ParseHttpDate rejects bad")
+        }
+
+        // ── Comparison ─────────────────────────────────
+        if (base.IsBefore(later) && later.IsAfter(base) && base.Equals(base)) {
+            Console.WriteLine("[PASS] Instant comparison")
+        } else {
+            Console.WriteLine("[FAIL] Instant comparison")
+        }
+
+        // ── Duration constructors ──────────────────────
+        let dms: Duration = Duration.FromMillis(2500)
+        let dsec: Duration = Duration.FromSeconds(2)
+        let dminus: Duration = dms.Minus(dsec)
+        let dminusMs: int = dminus.Millis()
+        if (dminusMs == 500) {
+            Console.WriteLine("[PASS] Duration arithmetic")
+        } else {
+            Console.WriteLine("[FAIL] Duration arithmetic")
+        }
+        let dx2: Duration = dsec.Times(3)
+        let dx2Sec: int = dx2.Seconds()
+        if (dx2Sec == 6) {
+            Console.WriteLine("[PASS] Duration Times")
+        } else {
+            Console.WriteLine("[FAIL] Duration Times")
+        }
+        let dneg: Duration = dsec.Negate()
+        let dnegSec: int = dneg.Seconds()
+        if (dnegSec == -2 && dneg.IsNegative()) {
+            Console.WriteLine("[PASS] Duration Negate")
+        } else {
+            Console.WriteLine("[FAIL] Duration Negate")
+        }
+
+        // ── Duration.Format ───────────────────────────
+        let zeroD: Duration = new Duration(0)
+        let nsD: Duration = new Duration(500)
+        let usD: Duration = new Duration(1500)
+        let msD: Duration = new Duration(1500000)
+        let secD: Duration = Duration.FromSeconds(5)
+        let minD: Duration = Duration.FromSeconds(125)
+        let hrD: Duration  = Duration.FromSeconds(3725)
+        let z: string  = zeroD.Format()
+        let ns: string = nsD.Format()
+        let us: string = usD.Format()
+        let ms: string = msD.Format()
+        let sc: string = secD.Format()
+        let mn: string = minD.Format()
+        let hr: string = hrD.Format()
+        if (z == "0s")     { Console.WriteLine("[PASS] dur fmt zero") }     else { Console.WriteLine("[FAIL] dur fmt zero got: " + z) }
+        if (ns == "500ns") { Console.WriteLine("[PASS] dur fmt ns") }       else { Console.WriteLine("[FAIL] dur fmt ns got: " + ns) }
+        if (us == "1us")   { Console.WriteLine("[PASS] dur fmt us") }       else { Console.WriteLine("[FAIL] dur fmt us got: " + us) }
+        if (ms == "1ms")   { Console.WriteLine("[PASS] dur fmt ms") }       else { Console.WriteLine("[FAIL] dur fmt ms got: " + ms) }
+        if (sc == "5s")    { Console.WriteLine("[PASS] dur fmt s") }        else { Console.WriteLine("[FAIL] dur fmt s got: " + sc) }
+        if (mn == "2m5s")  { Console.WriteLine("[PASS] dur fmt min") }      else { Console.WriteLine("[FAIL] dur fmt min got: " + mn) }
+        if (hr == "1h2m5s"){ Console.WriteLine("[PASS] dur fmt hour") }     else { Console.WriteLine("[FAIL] dur fmt hour got: " + hr) }
+
+        // ── Stopwatch produces non-negative elapsed ──
+        let sw: Stopwatch = new Stopwatch()
+        var sum: int = 0
+        for i in 0..10000 { sum = sum + i }
+        let elap: Duration = sw.Elapsed()
+        let elapNs: int = elap.Nanos()
+        if (elapNs >= 0) {
+            Console.WriteLine("[PASS] Stopwatch elapsed")
+        } else {
+            Console.WriteLine("[FAIL] Stopwatch elapsed")
+        }
+        // Reset + a second sample
+        let pre: Duration = sw.Reset()
+        let preNs: int = pre.Nanos()
+        let elap2: Duration = sw.Elapsed()
+        let elap2Ns: int = elap2.Nanos()
+        if (preNs >= 0 && elap2Ns >= 0 && elap2Ns < preNs + 1000000000) {
+            Console.WriteLine("[PASS] Stopwatch reset")
+        } else {
+            Console.WriteLine("[FAIL] Stopwatch reset")
+        }
+
+        // ── Sleep actually waits (measured by the monotonic clock) ──
+        // Sleep 20ms; the elapsed monotonic time should be at least
+        // ~15ms (scheduler slack) and comfortably under 2s.
+        // (Chain split across two lets — no `.Elapsed().Millis()` —
+        // so the sample compiles on the >=0.7.7 floor the CI tests.)
+        let swS: Stopwatch = new Stopwatch()
+        DateTime.SleepMillis(20)
+        let sleptD: Duration = swS.Elapsed()
+        let slept:  int      = sleptD.Millis()
+        if (slept >= 15 && slept < 2000) {
+            Console.WriteLine("[PASS] SleepMillis waits")
+        } else {
+            Console.WriteLine("[FAIL] SleepMillis waits got: " + String_FromInt(slept))
+        }
+
+        // Duration.Sleep() + zero/negative no-op (returns at once).
+        let swS2: Stopwatch = new Stopwatch()
+        let d20:  Duration  = Duration.FromMillis(20)
+        d20.Sleep()
+        DateTime.SleepMillis(0)
+        DateTime.SleepMillis(-5)
+        let slept2D: Duration = swS2.Elapsed()
+        let slept2:  int      = slept2D.Millis()
+        if (slept2 >= 15 && slept2 < 2000) {
+            Console.WriteLine("[PASS] Duration.Sleep + no-op")
+        } else {
+            Console.WriteLine("[FAIL] Duration.Sleep + no-op got: " + String_FromInt(slept2))
+        }
+    
+        // ── Local time (v0.3.0) — run_tests.sh pins TZ=Europe/Paris ──
+        let offW: int = DateTime.LocalOffsetSeconds(1768478400)   // 2026-01-15T12:00Z
+        let offS: int = DateTime.LocalOffsetSeconds(1784116800)   // 2026-07-15T12:00Z
+        if (offW == 3600 && offS == 7200) {
+            Console.WriteLine("[PASS] LocalOffsetSeconds DST")
+        } else {
+            Console.WriteLine("[FAIL] LocalOffsetSeconds DST")
+        }
+
+        let mid: int = DateTime.LocalToEpoch(2026, 3, 29, 0, 0, 0)   // DST day
+        let noon: int = DateTime.LocalToEpoch(2026, 10, 25, 12, 0, 0) // back to winter
+        let norm: int = DateTime.LocalToEpoch(2026, 1, 32, 0, 0, 0)   // = Feb 1
+        if (mid == 1774738800 && noon == 1792926000 && norm == 1769900400) {
+            Console.WriteLine("[PASS] LocalToEpoch")
+        } else {
+            Console.WriteLine("[FAIL] LocalToEpoch")
+        }
+
+        let il: Instant = Instant.FromUnixSeconds(1700000000)
+        let lp: List<int> = il.LocalParts()
+        if (il.FormatLocal() == "2023-11-14T23:13:20+01:00" && lp.Get(7) == 2) {
+            Console.WriteLine("[PASS] FormatLocal + weekday")
+        } else {
+            Console.WriteLine("[FAIL] FormatLocal + weekday")
+        }
+
+        let late: Instant = Instant.FromUnixSeconds(1774823400)   // 2026-03-29T22:30Z
+        let back: Instant = Instant.FromLocal(2026, 3, 30, 0, 30, 0)
+        if (late.LocalDate() == "2026-03-30" && back.UnixSeconds() == 1774823400) {
+            Console.WriteLine("[PASS] LocalDate + FromLocal")
+        } else {
+            Console.WriteLine("[FAIL] LocalDate + FromLocal")
+        }
+    }
+}

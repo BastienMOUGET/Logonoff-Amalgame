@@ -1,0 +1,7 @@
+# Generated artifacts from the letsencrypt-site example
+examples/letsencrypt-site/site
+examples/letsencrypt-site/site.c
+examples/letsencrypt-site/server
+examples/letsencrypt-site/server.c
+examples/letsencrypt-site/core
+examples/letsencrypt-site/certs/

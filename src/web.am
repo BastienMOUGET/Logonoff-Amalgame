@@ -1,0 +1,1111 @@
+namespace Logonoff
+
+import Amalgame.Collections
+import Amalgame.Json
+import Amalgame.Net.Http
+import Amalgame.Service
+
+// ── Web ───────────────────────────────────────────────
+//
+// Local web UI + JSON API on http://127.0.0.1:<port> (loopback only).
+//
+// Who is calling? There is no login: the browser connects from a
+// local port, the OS knows which process owns that socket, and that
+// process runs as the Windows user (Platform.PeerIdentity). Every
+// request is attributed that way, so two people logged on to the same
+// PC only ever see their own data.
+//
+// Because identity comes from the browser, a hostile web page open in
+// that browser could forge requests (CSRF) or rebind a DNS name to
+// 127.0.0.1. Hence:
+//   - Host must be 127.0.0.1:<port> or localhost:<port>;
+//   - mutating requests are POST with an `X-Logonoff: 1` header (a
+//     cross-site page can't add it without a CORS preflight, which is
+//     never granted) and, when present, a same-origin Origin.
+
+public class Caller {
+    public UserId:  int
+    public Account: string
+    public Sid:     string
+
+    public Caller() {
+        this.UserId = 0
+        this.Account = ""
+        this.Sid = ""
+    }
+}
+
+public class WebServer {
+    public Store:   Store
+    public Tracker: Tracker
+    public Port:    int
+    public WwwDir:  string
+    public Dev:     bool
+
+    public WebServer(store: Store, tracker: Tracker, port: int, wwwDir: string, dev: bool) {
+        this.Store   = store
+        this.Tracker = tracker
+        this.Port    = port
+        this.WwwDir  = wwwDir
+        this.Dev     = dev
+    }
+
+    public int Serve() {
+        Http1.SetLoopbackOnly(true)
+        Http1.SetMaxBodyBytes(65536)
+        let srv = this
+        let handler = conn => {
+            let req: HttpRequest = HttpRequest.FromH1Conn(conn)
+            Platform.Log("<- " + req.Method + " " + req.Path + " de " + req.RemoteAddr)
+            let resp: HttpResponse = srv.Handle(req)
+            Platform.Log("-> " + String_FromInt(resp.StatusCode) + " " + req.Path)
+            resp.WriteToH1Conn(conn)
+            return 0
+        }
+        Platform.Log("HTTP : écoute sur 127.0.0.1:" + String_FromInt(this.Port))
+        return Http1.Serve(this.Port, handler)
+    }
+
+    // ── responses ─────────────────────────────────────
+
+    public static HttpResponse JsonOk(body: string) {
+        return HttpResponse.New().Status(200)
+            .Header("Content-Type", "application/json; charset=utf-8")
+            .Header("Cache-Control", "no-store")
+            .Text(body)
+    }
+
+    public static HttpResponse Err(code: int, message: string) {
+        let f = new List<string>()
+        f.Add(Js.F("error", Js.S(message)))
+        return HttpResponse.New().Status(code)
+            .Header("Content-Type", "application/json; charset=utf-8")
+            .Header("Cache-Control", "no-store")
+            .Text(Js.Obj(f))
+    }
+
+    public static HttpResponse Ok() {
+        return WebServer.JsonOk("{\"ok\":true}")
+    }
+
+    // ── request helpers ───────────────────────────────
+
+    public static string Hdr(req: HttpRequest, name: string) {
+        if (req.Headers.Has(name)) { return req.Headers.Get(name) }
+        return ""
+    }
+
+    public static string Q(req: HttpRequest, name: string) {
+        if (req.Query.Has(name)) { return req.Query.Get(name) }
+        return ""
+    }
+
+    public static int PortOf(addr: string) {
+        let i: int = String_LastIndexOf(addr, ":")
+        if (i < 0) { return 0 }
+        return String_ToInt(String_Substring(addr, i + 1, -1))
+    }
+
+    public static string HostOf(addr: string) {
+        let i: int = String_LastIndexOf(addr, ":")
+        if (i < 0) { return addr }
+        return String_Substring(addr, 0, i)
+    }
+
+    public static string JStr(root: JsonValue, key: string) {
+        let v: JsonValue = root.Get(key)
+        if (v.IsString()) { return v.AsString() }
+        if (v.IsInt()) { return String_FromInt(v.AsInt()) }
+        return ""
+    }
+
+    public static int JInt(root: JsonValue, key: string) {
+        let v: JsonValue = root.Get(key)
+        if (v.IsInt()) { return v.AsInt() }
+        if (v.IsString()) { return String_ToInt(v.AsString()) }
+        if (v.IsBool()) {
+            if (v.AsBool()) { return 1 }
+        }
+        return 0
+    }
+
+    public static bool JBool(root: JsonValue, key: string) {
+        let v: JsonValue = root.Get(key)
+        if (v.IsBool()) { return v.AsBool() }
+        if (v.IsInt()) { return v.AsInt() != 0 }
+        return false
+    }
+
+    // Requested date (?date=YYYY-MM-DD), today by default.
+    public static string DateParam(req: HttpRequest, now: int) {
+        let d: string = WebServer.Q(req, "date")
+        if (Day.Valid(d)) { return d }
+        return Day.Of(now)
+    }
+
+    // ── guards ────────────────────────────────────────
+
+    public bool hostAllowed(req: HttpRequest) {
+        let host: string = String_ToLower(WebServer.Hdr(req, "host"))
+        let p: string = ":" + String_FromInt(this.Port)
+        return host == "127.0.0.1" + p || host == "localhost" + p
+    }
+
+    public bool originAllowed(req: HttpRequest) {
+        let origin: string = String_ToLower(WebServer.Hdr(req, "origin"))
+        if (String_Length(origin) == 0) { return true }
+        let p: string = ":" + String_FromInt(this.Port)
+        return origin == "http://127.0.0.1" + p || origin == "http://localhost" + p
+    }
+
+    public Caller identify(req: HttpRequest, now: int) {
+        let c = new Caller()
+        let host: string = WebServer.HostOf(req.RemoteAddr)
+        if (host != "127.0.0.1" && host != "::1" && host != "[::1]") { return c }
+        let ident: string = Platform.PeerIdentity(WebServer.PortOf(req.RemoteAddr), this.Port)
+        if (String_Length(ident) == 0) { return c }
+        let parts: List<string> = String_Split(ident, "|")
+        c.UserId = this.Tracker.UserFromIdentity(ident, now)
+        c.Sid = parts.Get(0)
+        c.Account = parts.Get(2)
+        return c
+    }
+
+    // Admin = member of the local Administrators group (checked on one
+    // of the caller's sessions, which needs the service's SYSTEM
+    // token). Dev and console modes: the account running the process.
+    public bool isAdmin(c: Caller) {
+        if (this.Dev || !Service.IsRunningUnderScm()) {
+            let me: List<string> = String_Split(this.Tracker.Me, "|")
+            return me.Count() > 0 && me.Get(0) == c.Sid
+        }
+        let sessions: List<int> = Service.UserSessions()
+        for i in 0..sessions.Count() {
+            let s: int = sessions.Get(i)
+            if (Service.SessionUserSid(s) == c.Sid) {
+                return Service.SessionUserIsAdmin(s)
+            }
+        }
+        return false
+    }
+
+    // ── dispatch ──────────────────────────────────────
+
+    public HttpResponse Handle(req: HttpRequest) {
+        if (!this.hostAllowed(req)) { return WebServer.Err(421, "bad host") }
+        let path: string = req.Path
+        if (!String_StartsWith(path, "/api/")) {
+            if (req.Method != "GET" && req.Method != "HEAD") { return WebServer.Err(405, "method not allowed") }
+            return this.serveStatic(path)
+        }
+        let now: int = Tracker.Now()
+        if (req.Method == "POST") {
+            if (WebServer.Hdr(req, "x-logonoff") != "1" || !this.originAllowed(req)) {
+                return WebServer.Err(403, "cross-site request refused")
+            }
+        } else if (req.Method != "GET") {
+            return WebServer.Err(405, "method not allowed")
+        }
+        let c: Caller = this.identify(req, now)
+        if (c.UserId == 0) { return WebServer.Err(403, "cannot identify the local user of this connection") }
+
+        var body: JsonValue = new JsonValue()
+        if (req.Method == "POST" && String_Length(req.Body) > 0) {
+            let pr: JsonResult = Json.Parse(req.Body)
+            if (!pr.Ok) { return WebServer.Err(400, "invalid JSON") }
+            body = pr.Value
+        }
+        let seg: List<string> = String_Split(String_Substring(path, 5, -1), "/")
+        let a: string = seg.Get(0)
+        var b: string = ""
+        var cc: string = ""
+        if (seg.Count() > 1) { b = seg.Get(1) }
+        if (seg.Count() > 2) { cc = seg.Get(2) }
+        let get: bool = req.Method == "GET"
+
+        if (a == "me" && get) { return this.me(c, now) }
+        if (a == "week" && get) { return this.week(c, req, now) }
+        if (a == "day" && get) { return this.day(c, req, now) }
+        if (a == "events" && get) { return this.events(c, req, now) }
+        if (a == "report" && get) { return this.report(c, req, now, false) }
+        if (a == "report.csv" && get) { return this.report(c, req, now, true) }
+        if (a == "export" && get) { return this.export(c, req, now) }
+        if (a == "qualify" && !get) { return this.qualify(c, body, now) }
+        if (a == "allocations" && !get) { return this.saveAllocations(c, body) }
+        if (a == "breaks" && !get && cc == "delete") {
+            if (this.Store.DeleteBreak(c.UserId, String_ToInt(b))) { return WebServer.Ok() }
+            return WebServer.Err(404, "not found")
+        }
+        if (a == "projects") {
+            if (get) { return this.projects(c) }
+            if (b == "") { return this.addProject(c, body) }
+            return this.updateProject(c, String_ToInt(b), body)
+        }
+        if (a == "switch" && !get) { return this.switchTo(c, body, now) }
+        if (a == "switches") {
+            if (get) { return this.switches(c, req, now) }
+            if (b == "") { return this.addSwitchAt(c, body, now) }
+            if (cc == "delete") {
+                if (this.Store.DeleteSwitch(c.UserId, String_ToInt(b))) { return WebServer.Ok() }
+                return WebServer.Err(404, "not found")
+            }
+            return this.updateSwitch(c, String_ToInt(b), body)
+        }
+        if (a == "intervals" && !get) {
+            if (b == "") { return this.addInterval(c, body, now) }
+            if (cc == "delete") {
+                if (this.Store.DeleteInterval(c.UserId, String_ToInt(b))) { return WebServer.Ok() }
+                return WebServer.Err(404, "not found")
+            }
+            if (b == "merge") { return this.mergeIntervals(c, body, now) }
+            if (cc == "split") {
+                let date: string = WebServer.JStr(body, "date")
+                if (!Day.Valid(date)) { return WebServer.Err(400, "date invalide") }
+                let at: int = Day.At(date, WebServer.JStr(body, "at"))
+                if (at < 0 || at > now) { return WebServer.Err(400, "heure de découpe invalide") }
+                if (this.Store.SplitInterval(c.UserId, String_ToInt(b), at)) { return WebServer.Ok() }
+                return WebServer.Err(400, "l'heure doit être à l'intérieur de la plage")
+            }
+            return this.updateInterval(c, String_ToInt(b), body, now)
+        }
+        if (a == "settings") {
+            if (get) { return this.settings(c) }
+            return this.saveSettings(c, body)
+        }
+        if (a == "machine") {
+            if (get) { return this.machine(c) }
+            return this.saveMachine(c, body)
+        }
+        if (a == "network") {
+            if (get) { return this.network() }
+            return this.nameNetwork(body)
+        }
+        if (a == "dev" && b == "event" && !get && this.Dev) {
+            // --dev only: push a session event through the real queue.
+            Service.InjectEvent(WebServer.JStr(body, "kind"), 1)
+            return WebServer.Ok()
+        }
+        if (a == "test-notify" && !get) {
+            let prefs: Prefs = Prefs.Load(this.Store, c.UserId)
+            this.Tracker.Notify(c.UserId, "Logonoff", "Notification de test. Cliquez pour ouvrir Logonoff.", prefs.NotifyHow, this.Tracker.Url("#today"))
+            return WebServer.Ok()
+        }
+        return WebServer.Err(404, "unknown endpoint")
+    }
+
+    // ── static files ──────────────────────────────────
+
+    public static string MimeOf(path: string) {
+        if (String_EndsWith(path, ".html")) { return "text/html; charset=utf-8" }
+        if (String_EndsWith(path, ".js")) { return "text/javascript; charset=utf-8" }
+        if (String_EndsWith(path, ".css")) { return "text/css; charset=utf-8" }
+        if (String_EndsWith(path, ".json") || String_EndsWith(path, ".webmanifest")) { return "application/manifest+json" }
+        if (String_EndsWith(path, ".svg")) { return "image/svg+xml" }
+        if (String_EndsWith(path, ".png")) { return "image/png" }
+        if (String_EndsWith(path, ".ico")) { return "image/x-icon" }
+        return "application/octet-stream"
+    }
+
+    public HttpResponse serveStatic(path: string) {
+        var rel: string = path
+        if (rel == "/" || rel == "") { rel = "/index.html" }
+        if (String_Contains(rel, "..") || String_Contains(rel, "\\") || String_Contains(rel, ":")) {
+            return WebServer.Err(404, "not found")
+        }
+        var full: string = this.WwwDir + rel
+        if (Platform.IsWindows()) { full = String_Replace(full, "/", "\\") }
+        if (!Platform.FileExists(full)) { return WebServer.Err(404, "not found") }
+        var cache: string = "no-cache"
+        if (String_EndsWith(rel, ".png") || String_EndsWith(rel, ".svg")) { cache = "max-age=86400" }
+        return HttpResponse.New().Status(200)
+            .Header("Content-Type", WebServer.MimeOf(rel))
+            .Header("Cache-Control", cache)
+            .Header("X-Content-Type-Options", "nosniff")
+            .Header("Content-Security-Policy", "default-src 'self'; img-src 'self' data:; style-src 'self'; script-src 'self'; connect-src 'self'; frame-ancestors 'none'")
+            .File(full)
+    }
+
+    // ── endpoints ─────────────────────────────────────
+
+    public HttpResponse me(c: Caller, now: int) {
+        let u: List<string> = this.Store.User(c.UserId)
+        let pid: int = this.Store.ProjectAt(c.UserId, now)
+        let f = new List<string>()
+        f.Add(Js.F("userId", Js.I(c.UserId)))
+        f.Add(Js.F("account", Js.S(c.Account)))
+        var display: string = c.Account
+        if (u.Count() > 3 && String_Length(u.Get(3)) > 0) { display = u.Get(3) }
+        f.Add(Js.F("display", Js.S(display)))
+        f.Add(Js.F("admin", Js.B(this.isAdmin(c))))
+        f.Add(Js.F("present", Js.B(this.Store.IsOpen(c.UserId))))
+        f.Add(Js.F("projectId", Js.I(pid)))
+        f.Add(Js.F("now", Js.I(now)))
+        f.Add(Js.F("today", Js.S(Day.Of(now))))
+        f.Add(Js.F("dev", Js.B(this.Dev)))
+        f.Add(Js.F("service", Js.B(Service.IsRunningUnderScm())))
+        return WebServer.JsonOk(Js.Obj(f))
+    }
+
+    public HttpResponse week(c: Caller, req: HttpRequest, now: int) {
+        let prefs: Prefs = Prefs.Load(this.Store, c.UserId)
+        let date: string = WebServer.DateParam(req, now)
+        return WebServer.JsonOk(TimeCalc.WeekJson(this.Store, prefs, c.UserId, date, now))
+    }
+
+    public HttpResponse day(c: Caller, req: HttpRequest, now: int) {
+        let prefs: Prefs = Prefs.Load(this.Store, c.UserId)
+        let date: string = WebServer.DateParam(req, now)
+        let r: DayReport = TimeCalc.ForDay(this.Store, prefs, c.UserId, date, now)
+        return WebServer.JsonOk(TimeCalc.DayJson(r, this.Store, c.UserId))
+    }
+
+    public HttpResponse events(c: Caller, req: HttpRequest, now: int) {
+        let date: string = WebServer.DateParam(req, now)
+        let rows: List<List<string>> = this.Store.Events(c.UserId, Day.Start(date, 0), Day.Start(date, 1))
+        let items = new List<string>()
+        for i in 0..rows.Count() {
+            let r: List<string> = rows.Get(i)
+            let f = new List<string>()
+            f.Add(Js.F("at", r.Get(0)))
+            f.Add(Js.F("hm", Js.S(Day.Hm(String_ToInt(r.Get(0))))))
+            f.Add(Js.F("kind", Js.S(r.Get(1))))
+            f.Add(Js.F("session", Js.I(String_ToInt(r.Get(2)))))
+            f.Add(Js.F("location", Js.S(r.Get(3))))
+            f.Add(Js.F("source", Js.S(r.Get(4))))
+            items.Add(Js.Obj(f))
+        }
+        return WebServer.JsonOk(Js.Arr(items))
+    }
+
+    // Time per project per day over [from, to] (dates inclusive),
+    // as JSON or CSV (Excel-friendly: `;` separator, decimal comma).
+    public HttpResponse report(c: Caller, req: HttpRequest, now: int, csv: bool) {
+        var from: string = WebServer.Q(req, "from")
+        var to: string = WebServer.Q(req, "to")
+        if (!Day.Valid(to)) { to = Day.Of(now) }
+        if (!Day.Valid(from)) { from = Day.Monday(to) }
+        if (Day.Compare(from, to) > 0) { return WebServer.Err(400, "from > to") }
+        let prefs: Prefs = Prefs.Load(this.Store, c.UserId)
+        let projects: List<List<string>> = this.Store.Projects(c.UserId, true)
+        let rows = new List<string>()
+        var lines: string = "date;code;projet;heures\r\n"
+        var d: string = from
+        var count: int = 0
+        while (Day.Compare(d, to) <= 0 && count < 400) {
+            let r: DayReport = TimeCalc.ForDay(this.Store, prefs, c.UserId, d, now)
+            for i in 0..r.ProjectIds.Count() {
+                let pid: int = r.ProjectIds.Get(i)
+                let secs: int = r.ProjectSecs.Get(i)
+                var code: string = ""
+                var label: string = "Sans projet"
+                for k in 0..projects.Count() {
+                    let pr: List<string> = projects.Get(k)
+                    if (String_ToInt(pr.Get(0)) == pid) {
+                        code = pr.Get(1)
+                        label = pr.Get(2)
+                    }
+                }
+                let f = new List<string>()
+                f.Add(Js.F("date", Js.S(d)))
+                f.Add(Js.F("projectId", Js.I(pid)))
+                f.Add(Js.F("code", Js.S(code)))
+                f.Add(Js.F("label", Js.S(label)))
+                f.Add(Js.F("seconds", Js.I(secs)))
+                rows.Add(Js.Obj(f))
+                lines = lines + d + ";" + WebServer.CsvCell(code) + ";" + WebServer.CsvCell(label) + ";" + WebServer.Hours(secs) + "\r\n"
+            }
+            d = Day.Add(d, 1)
+            count = count + 1
+        }
+        if (csv) {
+            return HttpResponse.New().Status(200)
+                .Header("Content-Type", "text/csv; charset=utf-8")
+                .Header("Content-Disposition", "attachment; filename=\"logonoff-" + from + "-" + to + ".csv\"")
+                .Text(String_FromCodepoint(65279) + lines)
+        }
+        let o = new List<string>()
+        o.Add(Js.F("from", Js.S(from)))
+        o.Add(Js.F("to", Js.S(to)))
+        o.Add(Js.F("rows", Js.Arr(rows)))
+        return WebServer.JsonOk(Js.Obj(o))
+    }
+
+    // ── export to a time-sheet tool (Espace Temps…) ─────
+    //
+    // One line per day × project, rendered from a user template. Tokens:
+    //   {date} JJ/MM/AAAA   {date_iso} AAAA-MM-JJ   {jour} lundi…
+    //   {code} {libelle}    {heures} 7,50  {heures_point} 7.50
+    //   {hhmm} 07:30        {minutes} 450  {compte} {nom}
+    // Encoding: UTF-8 with BOM, or Windows-1252 ("ansi") for older tools.
+
+    // "{name}" — braces built from bytes: a literal "{…}" would be
+    // string interpolation.
+    public static string Tok(name: string) {
+        return String_FromByte(123) + name + String_FromByte(125)
+    }
+
+    public static string DefaultExportHeader() {
+        return "Date;Imputation;Libellé;Heures"
+    }
+
+    public static string DefaultExportLine() {
+        return WebServer.Tok("date") + ";" + WebServer.Tok("code") + ";" + WebServer.Tok("libelle") + ";" + WebServer.Tok("heures")
+    }
+
+    public HttpResponse export(c: Caller, req: HttpRequest, now: int) {
+        var from: string = WebServer.Q(req, "from")
+        var to: string = WebServer.Q(req, "to")
+        if (!Day.Valid(to)) { to = Day.Of(now) }
+        if (!Day.Valid(from)) { from = Day.Monday(to) }
+        if (Day.Compare(from, to) > 0) { return WebServer.Err(400, "from > to") }
+        let scope: string = Prefs.Scope(c.UserId)
+        let header: string = this.Store.Setting(scope, "export_header", WebServer.DefaultExportHeader())
+        let tpl: string = this.Store.Setting(scope, "export_line", WebServer.DefaultExportLine())
+        let enc: string = this.Store.Setting(scope, "export_encoding", "utf8")
+        let skipNone: bool = this.Store.Setting(scope, "export_skip_none", "1") == "1"
+        let u: List<string> = this.Store.User(c.UserId)
+        var display: string = c.Account
+        if (u.Count() > 3 && String_Length(u.Get(3)) > 0) { display = u.Get(3) }
+        let prefs: Prefs = Prefs.Load(this.Store, c.UserId)
+        let projects: List<List<string>> = this.Store.Projects(c.UserId, true)
+        let crlf: string = String_FromByte(13) + String_FromByte(10)
+        var out: string = ""
+        if (String_Length(header) > 0) { out = header + crlf }
+        var d: string = from
+        var count: int = 0
+        while (Day.Compare(d, to) <= 0 && count < 400) {
+            let r: DayReport = TimeCalc.ForDay(this.Store, prefs, c.UserId, d, now)
+            // The lunch deduction comes off the "no project" share first,
+            // then the biggest project, so exported hours sum to Worked.
+            let secsList = new List<int>()
+            for i in 0..r.ProjectIds.Count() { secsList.Add(r.ProjectSecs.Get(i)) }
+            // A manual split is exported as typed.
+            if (!r.Overridden) { WebServer.applyDeduction(r.ProjectIds, secsList, r.Deduction) }
+            for i in 0..r.ProjectIds.Count() {
+                let pid: int = r.ProjectIds.Get(i)
+                let secs: int = secsList.Get(i)
+                if (secs <= 0 || (pid == 0 && skipNone)) { continue }
+                var code: string = ""
+                var label: string = "Sans projet"
+                for k in 0..projects.Count() {
+                    let pr: List<string> = projects.Get(k)
+                    if (String_ToInt(pr.Get(0)) == pid) {
+                        code = pr.Get(1)
+                        label = pr.Get(2)
+                    }
+                }
+                let parts: List<string> = String_Split(d, "-")
+                var line: string = tpl
+                line = String_Replace(line, WebServer.Tok("date_iso"), d)
+                line = String_Replace(line, WebServer.Tok("date"), parts.Get(2) + "/" + parts.Get(1) + "/" + parts.Get(0))
+                line = String_Replace(line, WebServer.Tok("jour"), WebServer.DayName(Day.Weekday(d)))
+                line = String_Replace(line, WebServer.Tok("code"), code)
+                line = String_Replace(line, WebServer.Tok("libelle"), label)
+                line = String_Replace(line, WebServer.Tok("heures_point"), String_Replace(WebServer.Hours(secs), ",", "."))
+                line = String_Replace(line, WebServer.Tok("heures"), WebServer.Hours(secs))
+                let mins: int = (secs + 30) / 60
+                line = String_Replace(line, WebServer.Tok("hhmm"), Day.Pad2(mins / 60) + ":" + Day.Pad2(mins % 60))
+                line = String_Replace(line, WebServer.Tok("minutes"), String_FromInt(mins))
+                line = String_Replace(line, WebServer.Tok("compte"), c.Account)
+                line = String_Replace(line, WebServer.Tok("nom"), display)
+                out = out + line + crlf
+            }
+            d = Day.Add(d, 1)
+            count = count + 1
+        }
+        var bodyOut: string = String_FromCodepoint(65279) + out
+        var charset: string = "utf-8"
+        if (enc == "ansi") {
+            bodyOut = Platform.ToCp1252(out)
+            charset = "windows-1252"
+        }
+        return HttpResponse.New().Status(200)
+            .Header("Content-Type", "text/csv; charset=" + charset)
+            .Header("Content-Disposition", "attachment; filename=\"espace-temps-" + from + "-" + to + ".csv\"")
+            .Header("Cache-Control", "no-store")
+            .Text(bodyOut)
+    }
+
+    // Remove `deduction` seconds: from project 0 first, then from the
+    // largest shares.
+    static void applyDeduction(ids: List<int>, secs: List<int>, deduction: int) {
+        var left: int = deduction
+        for i in 0..ids.Count() {
+            if (left > 0 && ids.Get(i) == 0) {
+                let take: int = TimeCalc.Min(left, secs.Get(i))
+                WebServer.setAt(secs, i, secs.Get(i) - take)
+                left = left - take
+            }
+        }
+        while (left > 0) {
+            var best: int = -1
+            for j in 0..secs.Count() {
+                if (secs.Get(j) > 0 && (best < 0 || secs.Get(j) > secs.Get(best))) { best = j }
+            }
+            if (best < 0) { return }
+            let take2: int = TimeCalc.Min(left, secs.Get(best))
+            WebServer.setAt(secs, best, secs.Get(best) - take2)
+            left = left - take2
+        }
+    }
+
+    static void setAt(l: List<int>, i: int, v: int) {
+        @c { if (l && i >= 0 && i < l->size) l->data[i] = (void*) (intptr_t) v; }
+    }
+
+    public static string DayName(wd: int) {
+        return match wd {
+            1 => "lundi"
+            2 => "mardi"
+            3 => "mercredi"
+            4 => "jeudi"
+            5 => "vendredi"
+            6 => "samedi"
+            _ => "dimanche"
+        }
+    }
+
+    // Seconds → "7,25" (hours, 2 decimals, decimal comma).
+    public static string Hours(secs: int) {
+        let cents: int = (secs * 100 + 1800) / 3600
+        let frac: int = cents % 100
+        var fs: string = String_FromInt(frac)
+        if (frac < 10) { fs = "0" + fs }
+        return String_FromInt(cents / 100) + "," + fs
+    }
+
+    public static string CsvCell(s: string) {
+        if (String_Contains(s, ";") || String_Contains(s, "\"") || String_Contains(s, "\n")) {
+            return "\"" + String_Replace(s, "\"", "\"\"") + "\""
+        }
+        return s
+    }
+
+    public HttpResponse projects(c: Caller) {
+        let rows: List<List<string>> = this.Store.Projects(c.UserId, true)
+        let items = new List<string>()
+        for i in 0..rows.Count() {
+            let r: List<string> = rows.Get(i)
+            let f = new List<string>()
+            f.Add(Js.F("id", r.Get(0)))
+            f.Add(Js.F("code", Js.S(r.Get(1))))
+            f.Add(Js.F("label", Js.S(r.Get(2))))
+            f.Add(Js.F("active", Js.B(r.Get(3) == "1")))
+            items.Add(Js.Obj(f))
+        }
+        return WebServer.JsonOk(Js.Arr(items))
+    }
+
+    public HttpResponse addProject(c: Caller, body: JsonValue) {
+        let code: string = String_Trim(WebServer.JStr(body, "code"))
+        let label: string = String_Trim(WebServer.JStr(body, "label"))
+        if (String_Length(code) == 0 || String_Length(code) > 64 || String_Length(label) > 200) {
+            return WebServer.Err(400, "numéro d'imputation requis (64 caractères max)")
+        }
+        let id: int = this.Store.AddProject(c.UserId, code, label)
+        if (id == 0) { return WebServer.Err(409, "ce numéro d'imputation existe déjà") }
+        let f = new List<string>()
+        f.Add(Js.F("id", Js.I(id)))
+        return WebServer.JsonOk(Js.Obj(f))
+    }
+
+    public HttpResponse updateProject(c: Caller, id: int, body: JsonValue) {
+        let code: string = String_Trim(WebServer.JStr(body, "code"))
+        let label: string = String_Trim(WebServer.JStr(body, "label"))
+        if (String_Length(code) == 0 || String_Length(code) > 64 || String_Length(label) > 200) {
+            return WebServer.Err(400, "numéro d'imputation requis (64 caractères max)")
+        }
+        if (!this.Store.UpdateProject(c.UserId, id, code, label, WebServer.JBool(body, "active"))) {
+            return WebServer.Err(409, "projet introuvable ou numéro déjà utilisé")
+        }
+        return WebServer.Ok()
+    }
+
+    public HttpResponse switchTo(c: Caller, body: JsonValue, now: int) {
+        let pid: int = WebServer.JInt(body, "projectId")
+        if (!this.projectOk(c, pid, true)) { return WebServer.Err(404, "projet introuvable") }
+        if (this.Store.ProjectAt(c.UserId, now) == pid) { return WebServer.Ok() }
+        this.Store.AddSwitch(c.UserId, pid, now)
+        return WebServer.Ok()
+    }
+
+    public HttpResponse switches(c: Caller, req: HttpRequest, now: int) {
+        let date: string = WebServer.DateParam(req, now)
+        let rows: List<List<string>> = this.Store.Switches(c.UserId, Day.Start(date, 0), Day.Start(date, 1))
+        let items = new List<string>()
+        for i in 0..rows.Count() {
+            let r: List<string> = rows.Get(i)
+            let at: int = String_ToInt(r.Get(2))
+            let f = new List<string>()
+            f.Add(Js.F("id", r.Get(0)))
+            f.Add(Js.F("projectId", Js.I(String_ToInt(r.Get(1)))))
+            f.Add(Js.F("at", Js.I(at)))
+            f.Add(Js.F("date", Js.S(Day.Of(at))))
+            f.Add(Js.F("hm", Js.S(Day.Hm(at))))
+            items.Add(Js.Obj(f))
+        }
+        return WebServer.JsonOk(Js.Arr(items))
+    }
+
+    // Retroactive switch: "from date time on, I was on project X".
+    public HttpResponse addSwitchAt(c: Caller, body: JsonValue, now: int) {
+        let pid: int = WebServer.JInt(body, "projectId")
+        if (!this.projectOk(c, pid, true)) { return WebServer.Err(404, "projet introuvable") }
+        let date: string = WebServer.JStr(body, "date")
+        if (!Day.Valid(date)) { return WebServer.Err(400, "date invalide") }
+        let at: int = Day.At(date, WebServer.JStr(body, "time"))
+        if (at < 0) { return WebServer.Err(400, "heure invalide") }
+        if (at > now) { return WebServer.Err(400, "l'heure est dans le futur") }
+        this.Store.AddSwitch(c.UserId, pid, at)
+        return WebServer.Ok()
+    }
+
+    public HttpResponse updateSwitch(c: Caller, id: int, body: JsonValue) {
+        let pid: int = WebServer.JInt(body, "projectId")
+        if (!this.projectOk(c, pid, true)) { return WebServer.Err(404, "projet introuvable") }
+        let date: string = WebServer.JStr(body, "date")
+        if (!Day.Valid(date)) { return WebServer.Err(400, "date invalide") }
+        let at: int = Day.At(date, WebServer.JStr(body, "time"))
+        if (at < 0) { return WebServer.Err(400, "heure invalide") }
+        if (!this.Store.UpdateSwitch(c.UserId, id, pid, at)) { return WebServer.Err(404, "not found") }
+        return WebServer.Ok()
+    }
+
+    // Manual interval or edit: date + "HH:MM" start/end. An end before
+    // the start means the next day (night shift).
+    public HttpResponse addInterval(c: Caller, body: JsonValue, now: int) {
+        let date: string = WebServer.JStr(body, "date")
+        if (!Day.Valid(date)) { return WebServer.Err(400, "date invalide") }
+        let s: int = Day.At(date, WebServer.JStr(body, "start"))
+        var e: int = Day.At(date, WebServer.JStr(body, "end"))
+        if (s < 0 || e < 0) { return WebServer.Err(400, "heure invalide") }
+        if (e <= s) { e = Day.At(Day.Add(date, 1), WebServer.JStr(body, "end")) }
+        if (e > now) { return WebServer.Err(400, "la fin est dans le futur") }
+        var activity: string = WebServer.JStr(body, "activity")
+        if (activity == "") { activity = "poste" }
+        if (!WebServer.IsIntervalActivity(activity)) { return WebServer.Err(400, "activité inconnue") }
+        let pid: int = WebServer.JInt(body, "projectId")
+        if (!this.projectOk(c, pid, false)) { return WebServer.Err(404, "projet introuvable") }
+        this.Store.AddManualInterval(c.UserId, s, e, activity, pid)
+        return WebServer.Ok()
+    }
+
+    public static bool IsWorkActivity(a: string) {
+        return a == "poste" || a == "reunion" || a == "deplacement" || a == "autre" || a == "urgence"
+    }
+
+    // What an interval may be tagged with: a work activity, or "perso"
+    // (personal use of the computer, not counted).
+    public static bool IsIntervalActivity(a: string) {
+        return WebServer.IsWorkActivity(a) || a == "perso"
+    }
+
+    // Project ids a caller may reference: 0 (none), -1 (personal mode,
+    // only where `personalOk`), or one of their own projects.
+    public bool projectOk(c: Caller, pid: int, personalOk: bool) {
+        if (pid == 0) { return true }
+        if (pid < 0) { return personalOk && pid == -1 }
+        return this.Store.OwnsProject(c.UserId, pid)
+    }
+
+    public static bool IsBreakKind(k: string) {
+        return k == "repas" || k == "perso"
+    }
+
+    // Qualify an absence: consecutive segments of the gap, each a
+    // worked activity (reunion / deplacement / autre, optionally pinned
+    // to a project) or a declared break (repas / perso). All segments
+    // are validated before anything is written.
+    public HttpResponse qualify(c: Caller, body: JsonValue, now: int) {
+        let date: string = WebServer.JStr(body, "date")
+        if (!Day.Valid(date)) { return WebServer.Err(400, "date invalide") }
+        let segs: JsonValue = body.Get("segments")
+        if (!segs.IsArray() || segs.Length() == 0 || segs.Length() > 20) { return WebServer.Err(400, "segments attendus") }
+        let starts = new List<int>()
+        let ends = new List<int>()
+        let kinds = new List<string>()
+        let pids = new List<int>()
+        for i in 0..segs.Length() {
+            let sg: JsonValue = segs.At(i)
+            let kind: string = WebServer.JStr(sg, "kind")
+            if (!WebServer.IsWorkActivity(kind) && !WebServer.IsBreakKind(kind)) { return WebServer.Err(400, "type d'absence inconnu") }
+            let st: int = Day.At(date, WebServer.JStr(sg, "start"))
+            let en: int = Day.At(date, WebServer.JStr(sg, "end"))
+            if (st < 0 || en < 0 || en <= st) { return WebServer.Err(400, "segment " + String_FromInt(i + 1) + " : heures invalides") }
+            if (en > now) { return WebServer.Err(400, "segment " + String_FromInt(i + 1) + " : dans le futur") }
+            let pid: int = WebServer.JInt(sg, "projectId")
+            if (!this.projectOk(c, pid, false)) { return WebServer.Err(404, "projet introuvable") }
+            starts.Add(st)
+            ends.Add(en)
+            kinds.Add(kind)
+            pids.Add(pid)
+        }
+        for j in 0..starts.Count() {
+            let k: string = kinds.Get(j)
+            if (WebServer.IsBreakKind(k)) {
+                this.Store.AddBreak(c.UserId, starts.Get(j), ends.Get(j), k)
+            } else {
+                this.Store.AddManualInterval(c.UserId, starts.Get(j), ends.Get(j), k, pids.Get(j))
+            }
+        }
+        return WebServer.Ok()
+    }
+
+    // Merge the selected intervals into one, from the earliest start to
+    // the latest end: the gaps in between (time spent on someone else's
+    // computer, an intervention…) become worked time. Refused unless they
+    // all count for the same project, or when a declared break (lunch…)
+    // lies in the span — the user re-assigns or deletes first.
+    public HttpResponse mergeIntervals(c: Caller, body: JsonValue, now: int) {
+        let date: string = WebServer.JStr(body, "date")
+        if (!Day.Valid(date)) { return WebServer.Err(400, "date invalide") }
+        let idsV: JsonValue = body.Get("ids")
+        if (!idsV.IsArray() || idsV.Length() < 2 || idsV.Length() > 100) { return WebServer.Err(400, "sélectionnez au moins deux plages") }
+        let rows: List<List<string>> = this.Store.Intervals(c.UserId, Day.Start(date, -1), Day.Start(date, 2))
+        let picked = new List<List<string>>()
+        for i in 0..idsV.Length() {
+            let iv: JsonValue = idsV.At(i)
+            var id: int = 0
+            if (iv.IsInt()) { id = iv.AsInt() }
+            var found: bool = false
+            for k in 0..rows.Count() {
+                let r: List<string> = rows.Get(k)
+                if (String_ToInt(r.Get(0)) == id) {
+                    found = true
+                    picked.Add(r)
+                }
+            }
+            if (!found) { return WebServer.Err(404, "plage introuvable") }
+        }
+        var start: int = 0
+        var end: int = 0
+        var open: bool = false
+        var keep: int = 0
+        var project: int = -2
+        var activity: string = ""
+        var note: string = ""
+        for j in 0..picked.Count() {
+            let r: List<string> = picked.Get(j)
+            let s: int = String_ToInt(r.Get(1))
+            let endS: string = r.Get(2)
+            var e: int = now
+            if (String_Length(endS) > 0) { e = String_ToInt(endS) } else { open = true }
+            if (keep == 0 || s < start) {
+                start = s
+                keep = String_ToInt(r.Get(0))
+            }
+            if (e > end) { end = e }
+            let act: string = r.Get(7)
+            if (act == "perso") { return WebServer.Err(400, "une plage personnelle ne peut pas être rassemblée") }
+            if (activity == "" || activity == "poste") { activity = act }
+            let p: int = this.effectiveProject(c, r, s, e)
+            if (p == -3) { return WebServer.Err(400, "la plage " + Day.Hm(s) + "–" + Day.Hm(e) + " change de projet en cours de route : découpez-la ou réattribuez-la d'abord") }
+            if (p == -1) { return WebServer.Err(400, "la plage " + Day.Hm(s) + "–" + Day.Hm(e) + " est en mode perso") }
+            if (project == -2) { project = p }
+            if (p != project) { return WebServer.Err(400, "les plages ne sont pas sur le même projet : réattribuez-les d'abord") }
+            let n: string = r.Get(9)
+            if (String_Length(n) > 0 && !String_Contains(note, n)) {
+                if (String_Length(note) > 0) { note = note + " · " }
+                note = note + n
+            }
+        }
+        let breaks: List<List<string>> = this.Store.Breaks(c.UserId, start, end)
+        if (breaks.Count() > 0) {
+            let br: List<string> = breaks.Get(0)
+            return WebServer.Err(400, "une pause déclarée (" + br.Get(3) + " " + Day.Hm(String_ToInt(br.Get(1))) + "–"
+                + Day.Hm(String_ToInt(br.Get(2))) + ") est dans l'intervalle : supprimez-la d'abord")
+        }
+        if (String_Length(note) > 500) { note = String_Substring(note, 0, 500) }
+        let drop = new List<int>()
+        for d in 0..picked.Count() {
+            let r2: List<string> = picked.Get(d)
+            let id2: int = String_ToInt(r2.Get(0))
+            if (id2 != keep) { drop.Add(id2) }
+        }
+        var endAt: int = end
+        if (open) { endAt = 0 }
+        if (!this.Store.MergeIntervals(c.UserId, keep, drop, start, endAt, activity, project, note)) {
+            return WebServer.Err(500, "fusion impossible")
+        }
+        return WebServer.Ok()
+    }
+
+    // Project an interval row counts for: its pinned project, else the
+    // switch in force over [s, e). -3 = the project changes inside,
+    // -1 = personal mode, 0 = none.
+    public int effectiveProject(c: Caller, row: List<string>, s: int, e: int) {
+        let pinned: int = String_ToInt(row.Get(8))
+        if (pinned > 0) { return pinned }
+        let sw: List<List<string>> = this.Store.Switches(c.UserId, s, e)
+        var p: int = -2
+        for i in 0..sw.Count() {
+            let r: List<string> = sw.Get(i)
+            let id: int = String_ToInt(r.Get(1))
+            if (p == -2) { p = id }
+            if (id != p) { return -3 }
+        }
+        if (p == -2) { return 0 }
+        return p
+    }
+
+    public HttpResponse updateInterval(c: Caller, id: int, body: JsonValue, now: int) {
+        let date: string = WebServer.JStr(body, "date")
+        if (!Day.Valid(date)) { return WebServer.Err(400, "date invalide") }
+        let s: int = Day.At(date, WebServer.JStr(body, "start"))
+        if (s < 0) { return WebServer.Err(400, "heure de début invalide") }
+        let endS: string = WebServer.JStr(body, "end")
+        var e: int = 0
+        if (String_Length(endS) > 0) {
+            e = Day.At(date, endS)
+            if (e < 0) { return WebServer.Err(400, "heure de fin invalide") }
+            if (e <= s) { e = Day.At(Day.Add(date, 1), endS) }
+            if (e > now) { return WebServer.Err(400, "la fin est dans le futur") }
+        }
+        if (s > now) { return WebServer.Err(400, "le début est dans le futur") }
+        if (body.Has("activity")) {
+            let activity: string = WebServer.JStr(body, "activity")
+            if (!WebServer.IsIntervalActivity(activity)) { return WebServer.Err(400, "activité inconnue") }
+            let pid: int = WebServer.JInt(body, "projectId")
+            if (!this.projectOk(c, pid, false)) { return WebServer.Err(404, "projet introuvable") }
+            let note: string = String_Trim(WebServer.JStr(body, "note"))
+            if (String_Length(note) > 500) { return WebServer.Err(400, "note trop longue (500 caractères max)") }
+            if (!this.Store.TagInterval(c.UserId, id, activity, pid, note)) { return WebServer.Err(404, "not found") }
+        }
+        if (!this.Store.UpdateInterval(c.UserId, id, s, e)) { return WebServer.Err(404, "not found") }
+        return WebServer.Ok()
+    }
+
+    // Manual split of a day between imputations: items [{projectId,
+    // minutes}]. An empty list goes back to the computed split.
+    public HttpResponse saveAllocations(c: Caller, body: JsonValue) {
+        let date: string = WebServer.JStr(body, "date")
+        if (!Day.Valid(date)) { return WebServer.Err(400, "date invalide") }
+        let items: JsonValue = body.Get("items")
+        if (!items.IsArray() || items.Length() > 50) { return WebServer.Err(400, "répartition attendue") }
+        let ids = new List<int>()
+        let secs = new List<int>()
+        var total: int = 0
+        for i in 0..items.Length() {
+            let it: JsonValue = items.At(i)
+            let pid: int = WebServer.JInt(it, "projectId")
+            let m: int = WebServer.JInt(it, "minutes")
+            if (m < 0 || m > 1440) { return WebServer.Err(400, "durée hors limites") }
+            if (!this.projectOk(c, pid, false)) { return WebServer.Err(404, "projet introuvable") }
+            for k in 0..ids.Count() {
+                if (ids.Get(k) == pid) { return WebServer.Err(400, "projet en double dans la répartition") }
+            }
+            ids.Add(pid)
+            secs.Add(m * 60)
+            total = total + m
+        }
+        if (total > 1440) { return WebServer.Err(400, "plus de 24 h sur la journée") }
+        if (!this.Store.SetAllocations(c.UserId, date, ids, secs)) { return WebServer.Err(500, "enregistrement impossible") }
+        return WebServer.Ok()
+    }
+
+    public HttpResponse settings(c: Caller) {
+        let p: Prefs = Prefs.Load(this.Store, c.UserId)
+        let t = new List<string>()
+        for i in 0..7 { t.Add(Js.I(p.Targets.Get(i))) }
+        let u: List<string> = this.Store.User(c.UserId)
+        var display: string = ""
+        if (u.Count() > 3) { display = u.Get(3) }
+        let f = new List<string>()
+        f.Add(Js.F("display", Js.S(display)))
+        f.Add(Js.F("targets", Js.Arr(t)))
+        f.Add(Js.F("lunchMin", Js.I(p.LunchMin)))
+        f.Add(Js.F("lunchAfter", Js.I(p.LunchAfter)))
+        f.Add(Js.F("lunchFrom", Js.I(p.LunchFrom)))
+        f.Add(Js.F("lunchTo", Js.I(p.LunchTo)))
+        f.Add(Js.F("notifyMode", Js.S(p.NotifyMode)))
+        f.Add(Js.F("notifyHow", Js.S(p.NotifyHow)))
+        f.Add(Js.F("notifyAhead", Js.I(p.NotifyAhead)))
+        f.Add(Js.F("absenceMin", Js.I(p.AbsenceMin)))
+        f.Add(Js.F("askOnReturn", Js.B(p.AskOnReturn)))
+        f.Add(Js.F("outsideMode", Js.S(p.OutsideMode)))
+        f.Add(Js.F("lunchAvgDays", Js.I(p.LunchAvgDays)))
+        f.Add(Js.F("workFrom", Js.I(p.WorkFrom)))
+        f.Add(Js.F("workTo", Js.I(p.WorkTo)))
+        let scope: string = Prefs.Scope(c.UserId)
+        f.Add(Js.F("exportHeader", Js.S(this.Store.Setting(scope, "export_header", WebServer.DefaultExportHeader()))))
+        f.Add(Js.F("exportLine", Js.S(this.Store.Setting(scope, "export_line", WebServer.DefaultExportLine()))))
+        f.Add(Js.F("exportEncoding", Js.S(this.Store.Setting(scope, "export_encoding", "utf8"))))
+        f.Add(Js.F("exportSkipNone", Js.B(this.Store.Setting(scope, "export_skip_none", "1") == "1")))
+        return WebServer.JsonOk(Js.Obj(f))
+    }
+
+    public HttpResponse saveSettings(c: Caller, body: JsonValue) {
+        let scope: string = Prefs.Scope(c.UserId)
+        let targets: JsonValue = body.Get("targets")
+        if (targets.IsArray()) {
+            if (targets.Length() != 7) { return WebServer.Err(400, "7 objectifs journaliers attendus") }
+            for i in 0..7 {
+                let tv: JsonValue = targets.At(i)
+                var m: int = 0
+                if (tv.IsInt()) { m = tv.AsInt() }
+                if (m < 0 || m > 1440) { return WebServer.Err(400, "objectif journalier hors limites") }
+                this.Store.SetSetting(scope, "target_" + String_FromInt(i + 1), String_FromInt(m))
+            }
+        }
+        if (body.Has("lunchMin")) {
+            let lm: int = WebServer.JInt(body, "lunchMin")
+            if (lm < 0 || lm > 240) { return WebServer.Err(400, "pause déjeuner hors limites") }
+            this.Store.SetSetting(scope, "lunch_min", String_FromInt(lm))
+        }
+        if (body.Has("lunchAfter")) {
+            let la: int = WebServer.JInt(body, "lunchAfter")
+            if (la < 0 || la > 1440) { return WebServer.Err(400, "seuil de pause hors limites") }
+            this.Store.SetSetting(scope, "lunch_after", String_FromInt(la))
+        }
+        if (body.Has("lunchFrom") || body.Has("lunchTo")) {
+            let lf: int = WebServer.JInt(body, "lunchFrom")
+            let lt: int = WebServer.JInt(body, "lunchTo")
+            if (lf < 0 || lt > 1440 || lf >= lt) { return WebServer.Err(400, "plage de pause invalide") }
+            this.Store.SetSetting(scope, "lunch_from", String_FromInt(lf))
+            this.Store.SetSetting(scope, "lunch_to", String_FromInt(lt))
+        }
+        if (body.Has("notifyMode")) {
+            let nm: string = WebServer.JStr(body, "notifyMode")
+            if (nm != "week" && nm != "day" && nm != "off") { return WebServer.Err(400, "mode de notification inconnu") }
+            this.Store.SetSetting(scope, "notify_mode", nm)
+        }
+        if (body.Has("notifyHow")) {
+            let nh: string = WebServer.JStr(body, "notifyHow")
+            if (nh != "toast" && nh != "message") { return WebServer.Err(400, "type de notification inconnu") }
+            this.Store.SetSetting(scope, "notify_how", nh)
+        }
+        if (body.Has("notifyAhead")) {
+            let na: int = WebServer.JInt(body, "notifyAhead")
+            if (na < 0 || na > 240) { return WebServer.Err(400, "préavis hors limites") }
+            this.Store.SetSetting(scope, "notify_ahead", String_FromInt(na))
+        }
+        if (body.Has("absenceMin")) {
+            let am: int = WebServer.JInt(body, "absenceMin")
+            if (am < 1 || am > 480) { return WebServer.Err(400, "seuil d'absence entre 1 et 480 min") }
+            this.Store.SetSetting(scope, "absence_min", String_FromInt(am))
+        }
+        if (body.Has("askOnReturn")) {
+            var ar: string = "0"
+            if (WebServer.JBool(body, "askOnReturn")) { ar = "1" }
+            this.Store.SetSetting(scope, "ask_on_return", ar)
+        }
+        if (body.Has("lunchAvgDays")) {
+            let ld: int = WebServer.JInt(body, "lunchAvgDays")
+            if (ld < 1 || ld > 60) { return WebServer.Err(400, "nombre de jours entre 1 et 60") }
+            this.Store.SetSetting(scope, "lunch_avg_days", String_FromInt(ld))
+        }
+        if (body.Has("outsideMode")) {
+            let om: string = WebServer.JStr(body, "outsideMode")
+            if (om != "count" && om != "perso") { return WebServer.Err(400, "règle hors horaires inconnue") }
+            let wf: int = WebServer.JInt(body, "workFrom")
+            let wt: int = WebServer.JInt(body, "workTo")
+            if (wf < 0 || wt > 1440 || wf >= wt) { return WebServer.Err(400, "horaires de travail invalides") }
+            this.Store.SetSetting(scope, "outside_mode", om)
+            this.Store.SetSetting(scope, "work_from", String_FromInt(wf))
+            this.Store.SetSetting(scope, "work_to", String_FromInt(wt))
+        }
+        if (body.Has("exportLine")) {
+            let el: string = WebServer.JStr(body, "exportLine")
+            let eh: string = WebServer.JStr(body, "exportHeader")
+            if (String_Length(el) == 0 || String_Length(el) > 500 || String_Length(eh) > 500) { return WebServer.Err(400, "modèle d'export invalide") }
+            this.Store.SetSetting(scope, "export_line", el)
+            this.Store.SetSetting(scope, "export_header", eh)
+        }
+        if (body.Has("exportEncoding")) {
+            let enc: string = WebServer.JStr(body, "exportEncoding")
+            if (enc != "utf8" && enc != "ansi") { return WebServer.Err(400, "encodage inconnu") }
+            this.Store.SetSetting(scope, "export_encoding", enc)
+        }
+        if (body.Has("exportSkipNone")) {
+            var sn: string = "0"
+            if (WebServer.JBool(body, "exportSkipNone")) { sn = "1" }
+            this.Store.SetSetting(scope, "export_skip_none", sn)
+        }
+        if (body.Has("display")) {
+            let dn: string = String_Trim(WebServer.JStr(body, "display"))
+            if (String_Length(dn) > 100) { return WebServer.Err(400, "nom trop long") }
+            this.Store.SetDisplayName(c.UserId, dn)
+        }
+        return WebServer.Ok()
+    }
+
+    public HttpResponse machine(c: Caller) {
+        let f = new List<string>()
+        f.Add(Js.F("admin", Js.B(this.isAdmin(c))))
+        f.Add(Js.F("port", Js.I(String_ToInt(this.Store.Setting("machine", "port", "8765")))))
+        f.Add(Js.F("heartbeatSec", Js.I(String_ToInt(this.Store.Setting("machine", "heartbeat_sec", "60")))))
+        let users: List<List<string>> = this.Store.Users()
+        let us = new List<string>()
+        for i in 0..users.Count() {
+            let u: List<string> = users.Get(i)
+            let uf = new List<string>()
+            uf.Add(Js.F("id", u.Get(0)))
+            uf.Add(Js.F("account", Js.S(u.Get(1))))
+            uf.Add(Js.F("display", Js.S(u.Get(2))))
+            us.Add(Js.Obj(uf))
+        }
+        f.Add(Js.F("users", Js.Arr(us)))
+        return WebServer.JsonOk(Js.Obj(f))
+    }
+
+    public HttpResponse saveMachine(c: Caller, body: JsonValue) {
+        if (!this.isAdmin(c)) { return WebServer.Err(403, "réservé aux administrateurs du poste") }
+        if (body.Has("port")) {
+            let port: int = WebServer.JInt(body, "port")
+            if (port < 1024 || port > 65535) { return WebServer.Err(400, "port entre 1024 et 65535") }
+            this.Store.SetSetting("machine", "port", String_FromInt(port))
+        }
+        if (body.Has("heartbeatSec")) {
+            let hb: int = WebServer.JInt(body, "heartbeatSec")
+            if (hb < 10 || hb > 600) { return WebServer.Err(400, "battement entre 10 et 600 s") }
+            this.Store.SetSetting("machine", "heartbeat_sec", String_FromInt(hb))
+            this.Tracker.Heartbeat = hb
+        }
+        return WebServer.Ok()
+    }
+
+    // Current network + every named one.
+    public HttpResponse network() {
+        let gw: string = Platform.DefaultGateway()
+        let parts: List<string> = String_Split(gw, "|")
+        var ip: string = ""
+        var mac: string = ""
+        if (parts.Count() >= 2) {
+            ip = parts.Get(0)
+            mac = parts.Get(1)
+        }
+        let key: string = Tracker.LocationKey()
+        let named: List<List<string>> = this.Store.Settings("location")
+        let items = new List<string>()
+        var label: string = ""
+        for i in 0..named.Count() {
+            let r: List<string> = named.Get(i)
+            if (r.Get(0) == key) { label = r.Get(1) }
+            let f = new List<string>()
+            f.Add(Js.F("key", Js.S(r.Get(0))))
+            f.Add(Js.F("label", Js.S(r.Get(1))))
+            items.Add(Js.Obj(f))
+        }
+        let o = new List<string>()
+        o.Add(Js.F("key", Js.S(key)))
+        o.Add(Js.F("ip", Js.S(ip)))
+        o.Add(Js.F("mac", Js.S(mac)))
+        o.Add(Js.F("label", Js.S(label)))
+        o.Add(Js.F("known", Js.Arr(items)))
+        return WebServer.JsonOk(Js.Obj(o))
+    }
+
+    public HttpResponse nameNetwork(body: JsonValue) {
+        let key: string = String_Trim(WebServer.JStr(body, "key"))
+        let label: string = String_Trim(WebServer.JStr(body, "label"))
+        if (String_Length(key) == 0 || String_Length(key) > 64 || String_Length(label) > 64) {
+            return WebServer.Err(400, "réseau ou nom invalide")
+        }
+        if (String_Length(label) == 0) {
+            this.Store.DeleteSetting("location", key)
+        } else {
+            this.Store.SetSetting("location", key, label)
+        }
+        return WebServer.Ok()
+    }
+}

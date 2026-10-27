@@ -1,0 +1,66 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+    tags: ['v*']
+  pull_request:
+    branches: [main, master]
+  workflow_dispatch:
+
+jobs:
+  test:
+    name: Test against amc ${{ matrix.amc-tag }}
+    runs-on: ubuntu-latest
+
+    # No service container — threading primitives are self-contained.
+    # libc pthread and libgc are already on every Ubuntu runner; the
+    # amc release tarball brings the runtime headers along.
+
+    strategy:
+      fail-fast: false
+      matrix:
+        # v0.8.19+ required (cgen + LSP fixes from the postgresql
+        # session). Append tags as amc cuts meaningfully relevant
+        # releases.
+        amc-tag: [v0.8.20]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system deps (libgc + libcurl)
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y libgc-dev libcurl4-openssl-dev
+
+      - name: Download amc ${{ matrix.amc-tag }}
+        run: |
+          set -e
+          TAG="${{ matrix.amc-tag }}"
+          VERSION="${TAG#v}"
+          curl -sSL -o amc.tar.gz \
+            "https://github.com/amalgame-lang/Amalgame/releases/download/${TAG}/amc-${VERSION}-linux-x86_64.tar.gz"
+          mkdir -p $RUNNER_TEMP/amc-install
+          tar -xzf amc.tar.gz -C $RUNNER_TEMP/amc-install --strip-components=1
+          echo "AMC=$RUNNER_TEMP/amc-install/bin/amc" >> $GITHUB_ENV
+          echo "AMC_RUNTIME=$RUNNER_TEMP/amc-install/share/amalgame/runtime" >> $GITHUB_ENV
+
+      - name: Probe libgc thread support
+        run: |
+          cat > /tmp/gcprobe.c <<'EOF'
+          #define GC_THREADS
+          #include <gc.h>
+          #include <pthread.h>
+          int main(void) { pthread_t t; (void)GC_pthread_create(&t,0,0,0); return 0; }
+          EOF
+          if gcc /tmp/gcprobe.c -lgc -lpthread -o /tmp/gcprobe 2>&1; then
+            echo "  GC_pthread_create: OK"
+          else
+            echo "  GC_pthread_create: MISSING — libgc lacks thread support"
+            exit 1
+          fi
+
+      - name: Run end-to-end tests
+        run: |
+          chmod +x ./tests/run_tests.sh
+          ./tests/run_tests.sh "$AMC"

@@ -1,0 +1,112 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  test:
+    name: Test against amc ${{ matrix.amc-tag }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # Requires amc 0.7.7+ for the cross-class external forward
+        # decl fix (RegisterExternalProg 2-pass split). Earlier amc
+        # versions mis-resolve the return type of a method that
+        # returns another class from the same facade.
+        amc-tag: [v0.7.7]
+    steps:
+      - name: Checkout package
+        uses: actions/checkout@v4
+
+      - name: Install system deps
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y libgc-dev libcurl4-openssl-dev
+
+      - name: Download amc ${{ matrix.amc-tag }}
+        run: |
+          set -e
+          TAG="${{ matrix.amc-tag }}"
+          VERSION="${TAG#v}"
+          curl -sSL -o amc.tar.gz \
+            "https://github.com/amalgame-lang/Amalgame/releases/download/${TAG}/amc-${VERSION}-linux-x86_64.tar.gz"
+          mkdir -p $RUNNER_TEMP/amc-install
+          tar -xzf amc.tar.gz -C $RUNNER_TEMP/amc-install --strip-components=1
+          echo "AMC=$RUNNER_TEMP/amc-install/amc" >> $GITHUB_ENV
+          echo "AMC_RUNTIME=$RUNNER_TEMP/amc-install/runtime" >> $GITHUB_ENV
+
+      - name: Verify amc
+        run: $AMC --version
+
+      - name: Run tests
+        run: ./tests/run_tests.sh "$AMC"
+
+  test-windows:
+    # Compiles the Windows-only paths (SCM handler, WTS helpers,
+    # token / SID / launch code) that the Linux job never sees, then
+    # runs the same test program in console mode.
+    name: Test on Windows (MSYS2, amc ${{ matrix.amc-tag }})
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        amc-tag: [v0.8.90]
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      - name: Checkout package
+        uses: actions/checkout@v4
+
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: true
+          install: >-
+            mingw-w64-x86_64-gcc
+            mingw-w64-x86_64-gc
+            mingw-w64-x86_64-curl
+            mingw-w64-x86_64-libsystre
+            mingw-w64-x86_64-zlib
+            unzip
+
+      - name: Download amc ${{ matrix.amc-tag }}
+        run: |
+          set -e
+          TAG="${{ matrix.amc-tag }}"
+          VERSION="${TAG#v}"
+          curl -sSL -o amc.zip \
+            "https://github.com/amalgame-lang/Amalgame/releases/download/${TAG}/amc-${VERSION}-windows-x86_64.zip"
+          unzip -q amc.zip -d amc-install
+          echo "AMC_HOME=$(cd amc-install/amc-${VERSION}-windows-x86_64 && pwd)" >> $GITHUB_ENV
+
+      - name: Compile facade + test program, run
+        run: |
+          set -e
+          B="$RUNNER_TEMP/svc" && mkdir -p "$B/proj"
+          "$AMC_HOME/bin/amc.exe" --lib --quiet facade.am -o "$B/Service-facade"
+          gcc -O2 -Wall -I"$AMC_HOME/share/amalgame/runtime" -c "$B/Service-facade.c" -o "$B/Service-facade.o"
+          ar rcs "$B/libamalgame-pkg-Service.a" "$B/Service-facade.o"
+          # Same fake-cache layout as tests/run_tests.sh so the test
+          # program resolves `import Amalgame.Service` to this tree.
+          mkdir -p "$B/cache/github.com/amalgame-lang"
+          cp -r "$PWD" "$B/cache/github.com/amalgame-lang/amalgame-service"
+          mv "$B/cache/github.com/amalgame-lang/amalgame-service" \
+             "$B/cache/github.com/amalgame-lang/v0.1.0_deadbeef.tmp"
+          mkdir -p "$B/cache/github.com/amalgame-lang/amalgame-service"
+          mv "$B/cache/github.com/amalgame-lang/v0.1.0_deadbeef.tmp" \
+             "$B/cache/github.com/amalgame-lang/amalgame-service/v0.1.0_deadbeef"
+          cp tests/stdlib_service.am "$B/proj/test.am"
+          printf '[[package]]\nname = "amalgame-service"\ngit  = "github.com/amalgame-lang/amalgame-service"\ntag  = "v0.1.0"\nrev  = "deadbeefcafebabe0000000000000000000000ab"\n' > "$B/proj/amalgame.lock"
+          export AMALGAME_PACKAGES_DIR="$B/cache"
+          (cd "$B/proj" && "$AMC_HOME/bin/amc.exe" -o test test.am --quiet)
+          gcc -O2 -I"$AMC_HOME/share/amalgame/runtime" "$B/proj/test.c" "$B/libamalgame-pkg-Service.a" \
+              -lgc -lm -lcurl -lz -lsystre -ltre -lws2_32 -lbcrypt -o "$B/proj/test.exe"
+          "$B/proj/test.exe" | tee "$B/out.txt"
+          ! grep -q "\[FAIL\]" "$B/out.txt"

@@ -1,0 +1,167 @@
+namespace Logonoff
+
+import Amalgame.Collections
+import Amalgame.IO
+import Amalgame.Net.Http
+import Amalgame.Service
+import Amalgame.Threading
+
+// ── Logonoff ──────────────────────────────────────────
+//
+// One executable, several modes:
+//
+//   logonoff --service        run under the Windows SCM (what
+//                             install.cmd registers): session/power
+//                             events + web UI on 127.0.0.1:<port>.
+//   logonoff --console        same in a console, without the SCM:
+//                             presence comes from polling the
+//                             sessions (reconcile) — for trying it
+//                             out on Windows without installing.
+//   logonoff --dev            development (any OS): no session
+//                             probing, the current user is "present"
+//                             from start to stop; data in ./data.
+//   logonoff --notify T M [U] show a tray notification, opening URL U
+//                             on click (started by the service inside
+//                             the user's session).
+//   logonoff --open           open the UI in the default browser.
+//
+// Data: %ProgramData%\Logonoff\logonoff.db for the service,
+// %LOCALAPPDATA%\Logonoff for --console, <exe dir>/data for --dev
+// (override with LOGONOFF_DATA).
+
+public class Program {
+    public static string Arg(i: int) {
+        return Platform.Arg(i)
+    }
+
+    public static string Sep() {
+        if (Platform.IsWindows()) { return "\\" }
+        return "/"
+    }
+
+    public static string DataDir(mode: string) {
+        let forced: string = Platform.Env("LOGONOFF_DATA")
+        if (String_Length(forced) > 0) { return forced }
+        if (Platform.IsWindows() && mode == "--service") {
+            var pd: string = Platform.Env("ProgramData")
+            if (String_Length(pd) == 0) { pd = "C:\\ProgramData" }
+            return pd + "\\Logonoff"
+        }
+        if (Platform.IsWindows() && mode == "--console") {
+            return Platform.Env("LOCALAPPDATA") + "\\Logonoff"
+        }
+        return Platform.ExeDir() + Program.Sep() + "data"
+    }
+
+    public static void Usage() {
+        Console.WriteLine("Logonoff — temps de présence et temps par projet")
+        Console.WriteLine("")
+        Console.WriteLine("  logonoff --service     service Windows (enregistré par install.cmd)")
+        Console.WriteLine("  logonoff --console     même chose dans une console, sans installer")
+        Console.WriteLine("  logonoff --dev         développement : utilisateur courant présent")
+        Console.WriteLine("  logonoff --open        ouvrir l'interface dans le navigateur")
+        Console.WriteLine("  logonoff --notify T M  afficher une notification")
+    }
+
+    // Port of the running instance: written next to the database at
+    // start-up (readable by every user), 8765 by default.
+    public static int KnownPort() {
+        let modes = new List<string>()
+        modes.Add("--service")
+        modes.Add("--console")
+        modes.Add("--dev")
+        for i in 0..modes.Count() {
+            let f: string = Program.DataDir(modes.Get(i)) + Program.Sep() + "port.txt"
+            if (Platform.FileExists(f)) {
+                let p: int = String_ToInt(String_Trim(File.ReadAll(f)))
+                if (p > 0) { return p }
+            }
+        }
+        return 8765
+    }
+
+    public static int Main(string[] args) {
+        Platform.ConsoleUtf8()
+        let mode: string = Program.Arg(1)
+        if (mode == "--notify") {
+            // Long enough to be read and clicked; ends early on dismissal.
+            Platform.ShowBalloon(Program.Arg(2), Program.Arg(3), 30, Program.Arg(4))
+            return 0
+        }
+        if (mode == "--open") {
+            Platform.OpenUrl("http://127.0.0.1:" + String_FromInt(Program.KnownPort()) + "/")
+            return 0
+        }
+        if (mode != "--service" && mode != "--console" && mode != "--dev") {
+            Program.Usage()
+            if (mode == "--help" || mode == "-h") { return 0 }
+            return 2
+        }
+        let dev: bool = mode == "--dev"
+
+        if (mode == "--service") {
+            Service.EnableSessionEvents()
+            Service.RunAsService("Logonoff")
+        } else {
+            Service.Install()
+        }
+
+        let dataDir: string = Program.DataDir(mode)
+        if (!Platform.EnsureDir(dataDir)) {
+            Console.WriteError("cannot create data directory " + dataDir)
+            return 1
+        }
+        if (mode == "--service") {
+            Platform.LogToFile(dataDir + Program.Sep() + "logonoff.log")
+        }
+        Platform.Log("démarrage " + mode + " — données " + dataDir)
+        let store: Store = Store.Open(dataDir + Program.Sep() + "logonoff.db")
+        if (!store.Ready) {
+            Console.WriteError("database: " + store.Error)
+            return 1
+        }
+
+        var port: int = String_ToInt(store.Setting("machine", "port", "8765"))
+        let envPort: string = Platform.Env("LOGONOFF_PORT")
+        if (String_Length(envPort) > 0) { port = String_ToInt(envPort) }
+        File.WriteAll(dataDir + Program.Sep() + "port.txt", String_FromInt(port))
+
+        Platform.Log("base ouverte, port " + String_FromInt(port))
+        let tracker: Tracker = new Tracker(store, dev)
+        tracker.Port = port
+        tracker.Start()
+        var scm: string = "non"
+        if (Service.IsRunningUnderScm()) { scm = "oui" }
+        Platform.Log("capture démarrée (SCM : " + scm + ", identité : " + tracker.Me + ")")
+
+        var www: string = Platform.ExeDir() + Program.Sep() + "www"
+        let envWww: string = Platform.Env("LOGONOFF_WWW")
+        if (String_Length(envWww) > 0) { www = envWww }
+        let web: WebServer = new WebServer(store, tracker, port, www, dev)
+
+        // Capture loop on its own thread; the HTTP server owns this one.
+        // Either side stopping (SCM stop, Ctrl-C, SIGTERM) stops both.
+        let loop = (unused: int) => {
+            while (!Service.ShouldStop() && !Http1.IsStopping()) {
+                tracker.Tick()
+                Service.Sleep(1000)
+            }
+            Platform.Log("arrêt demandé")
+            tracker.Stop()
+            Http1.RequestShutdown()
+            // Every write is already committed (SQLite autocommit). On
+            // Windows the HTTP thread stays blocked in accept() whatever
+            // RequestShutdown does, so end the process from here.
+            Console.WriteLine("Logonoff arrêté.")
+            Platform.Exit(0)
+            return 0
+        }
+        let t = Threading.ThreadSpawn(loop, 0)
+
+        Console.WriteLine("Logonoff " + mode + " — http://127.0.0.1:" + String_FromInt(port) + "/  (données : " + dataDir + ")")
+        let rc: int = web.Serve()
+        Service.RequestStop()
+        Threading.ThreadJoin(t)
+        return rc
+    }
+}

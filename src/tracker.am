@@ -1,0 +1,306 @@
+namespace Logonoff
+
+import Amalgame.Collections
+import Amalgame.DateTime
+import Amalgame.Service
+
+// ── Tracker ───────────────────────────────────────────
+//
+// Turns session / power events into presence intervals.
+//
+//   present  ⇐ Logon, Unlock, ConsoleConnect, RemoteConnect (if the
+//              session is active and not locked), Resume (via
+//              reconcile)
+//   absent   ⇐ Lock, Logoff, ConsoleDisconnect, RemoteDisconnect for
+//              that session's user; Suspend / Shutdown / Stop for all
+//
+// Events are the precise clock; `reconcile()` is the safety net: on
+// resume, at start-up and on every heartbeat it compares the open
+// intervals with the real session states (active + unlocked) and
+// fixes the difference, so a missed event costs at most one
+// heartbeat. A heartbeat gap (machine frozen, or asleep without a
+// Suspend event) closes intervals at the last tick before the gap.
+// After a crash, `Store.CloseStale` closes them at the last heartbeat.
+//
+// Identity: a session maps to its user's SID (Service.SessionUserSid,
+// LocalSystem only). In console mode the token is out of reach, so
+// only sessions of the account running the process are tracked.
+
+public class Tracker {
+    public Store:       Store
+    public Dev:         bool      // --dev: no SCM, current user only
+    public UnderScm:    bool
+    public Heartbeat:   int       // seconds
+    public LastTick:    int
+    public SessionUser: Map<string, string>   // session id → user id
+    public Me:          string    // CurrentIdentity(), console fallback
+    public ExePath:     string
+    public Port:        int       // web UI port, for links in notifications
+
+    public Tracker(store: Store, dev: bool) {
+        this.Store       = store
+        this.Dev         = dev
+        this.UnderScm    = false
+        this.Heartbeat   = 60
+        this.LastTick    = 0
+        this.SessionUser = new Map<string, string>()
+        this.Me          = Platform.CurrentIdentity()
+        this.Port        = 8765
+        var sep: string = "/"
+        var exe: string = "logonoff"
+        if (Platform.IsWindows()) {
+            sep = "\\"
+            exe = "logonoff.exe"
+        }
+        this.ExePath = Platform.ExeDir() + sep + exe
+    }
+
+    public static int Now() {
+        let i: Instant = Instant.Now()
+        return i.UnixSeconds()
+    }
+
+    // "id|domain|name" → user id (created on first sight).
+    public int UserFromIdentity(ident: string, now: int) {
+        let parts: List<string> = String_Split(ident, "|")
+        if (parts.Count() < 3) { return 0 }
+        let sid: string = parts.Get(0)
+        if (String_Length(sid) == 0) { return 0 }
+        var account: string = parts.Get(2)
+        if (String_Length(parts.Get(1)) > 0) { account = parts.Get(1) + "\\" + parts.Get(2) }
+        return this.Store.UpsertUser(sid, account, now)
+    }
+
+    // User id for a session; 0 if it has no user or can't be resolved.
+    public int UserForSession(sessionId: int, now: int) {
+        // Dev: every session is ours (events come from /api/dev/event).
+        if (this.Dev) { return this.UserFromIdentity(this.Me, now) }
+        let key: string = String_FromInt(sessionId)
+        if (this.SessionUser.Has(key)) { return String_ToInt(this.SessionUser.Get(key)) }
+        let name: string = Service.SessionUserName(sessionId)
+        if (String_Length(name) == 0) { return 0 }
+        let sid: string = Service.SessionUserSid(sessionId)
+        var uid: int = 0
+        if (String_Length(sid) > 0) {
+            uid = this.UserFromIdentity(sid + "|" + Service.SessionDomain(sessionId) + "|" + name, now)
+        } else {
+            // Console mode: only our own account can be identified.
+            let me: List<string> = String_Split(this.Me, "|")
+            if (me.Count() >= 3 && String_ToLower(me.Get(2)) == String_ToLower(name)) {
+                uid = this.UserFromIdentity(this.Me, now)
+            }
+        }
+        if (uid > 0) { this.SessionUser.Set(key, String_FromInt(uid)) }
+        return uid
+    }
+
+    // Network key of the current location: gateway MAC, or IP when
+    // the MAC can't be read. Names are attached in the settings UI.
+    public static string LocationKey() {
+        let gw: string = Platform.DefaultGateway()
+        if (String_Length(gw) == 0) { return "" }
+        let parts: List<string> = String_Split(gw, "|")
+        if (parts.Count() >= 2 && String_Length(parts.Get(1)) > 0) { return parts.Get(1) }
+        return parts.Get(0)
+    }
+
+    public static bool IsArrival(kind: string) {
+        return kind == "Logon" || kind == "Unlock" || kind == "ConsoleConnect" || kind == "RemoteConnect"
+    }
+
+    public static bool IsDeparture(kind: string) {
+        return kind == "Lock" || kind == "Logoff" || kind == "ConsoleDisconnect" || kind == "RemoteDisconnect"
+    }
+
+    // Present = session active and not locked. Unknown lock state
+    // (pre-Windows 8) counts as unlocked; events still drive it.
+    public static bool SessionPresent(sessionId: int) {
+        if (Service.SessionState(sessionId) != "Active") { return false }
+        return Service.SessionLockState(sessionId) != "Locked"
+    }
+
+    public void Handle(e: ServiceEvent) {
+        let at: int = e.TimeNanos / 1000000000
+        let loc: string = Tracker.LocationKey()
+        var uid: int = 0
+        if (e.SessionId >= 0) { uid = this.UserForSession(e.SessionId, at) }
+        Platform.Log("événement " + e.Kind + " session " + String_FromInt(e.SessionId) + " utilisateur " + String_FromInt(uid))
+        this.Store.AddEvent(uid, e.SessionId, e.Kind, at, loc, "scm")
+
+        if (Tracker.IsArrival(e.Kind) && uid > 0) {
+            // ConsoleConnect lands on the lock screen after a fast user
+            // switch: wait for the Unlock in that case.
+            if (e.Kind == "Logon" || this.Dev || Tracker.SessionPresent(e.SessionId)) {
+                let back: int = this.Store.LastEndBefore(uid, at)
+                if (this.Store.OpenInterval(uid, at, e.Kind, loc)) {
+                    this.askAboutAbsence(uid, back, at)
+                }
+            }
+        } else if (Tracker.IsDeparture(e.Kind) && uid > 0) {
+            this.Store.CloseInterval(uid, at, e.Kind)
+        } else if (e.Kind == "Suspend" || e.Kind == "Shutdown" || e.Kind == "Stop") {
+            this.Store.CloseAllOpen(at, e.Kind)
+        } else if (e.Kind == "Resume") {
+            this.reconcile(at, "Resume")
+        }
+        if (e.Kind == "Logoff" || e.Kind == "SessionTerminate") {
+            this.SessionUser.Remove(String_FromInt(e.SessionId))
+        }
+    }
+
+    // Align open intervals with the real session states. No-op in dev
+    // mode and when a session's user can't be identified (closing on
+    // partial knowledge would cut someone who is actually there).
+    public void reconcile(now: int, reason: string) {
+        if (this.Dev) { return }
+        let sessions: List<int> = Service.UserSessions()
+        let present = new List<int>()
+        var complete: bool = true
+        for i in 0..sessions.Count() {
+            let sid: int = sessions.Get(i)
+            let uid: int = this.UserForSession(sid, now)
+            if (uid == 0) {
+                complete = false
+                continue
+            }
+            if (Tracker.SessionPresent(sid)) { present.Add(uid) }
+        }
+        let loc: string = Tracker.LocationKey()
+        for j in 0..present.Count() {
+            let u: int = present.Get(j)
+            if (this.Store.OpenInterval(u, now, reason, loc)) {
+                this.Store.AddEvent(u, -1, "Reconcile", now, loc, "reconcile")
+            }
+        }
+        if (!complete) { return }
+        let open: List<int> = this.Store.OpenUsers()
+        for k in 0..open.Count() {
+            let u2: int = open.Get(k)
+            var there: bool = false
+            for m in 0..present.Count() {
+                if (present.Get(m) == u2) { there = true }
+            }
+            if (!there && this.Store.CloseInterval(u2, now, reason)) {
+                this.Store.AddEvent(u2, -1, "Reconcile", now, loc, "reconcile")
+            }
+        }
+    }
+
+    public void Start() {
+        let now: int = Tracker.Now()
+        this.UnderScm = Service.IsRunningUnderScm()
+        this.Heartbeat = String_ToInt(this.Store.Setting("machine", "heartbeat_sec", "60"))
+        if (this.Heartbeat < 10) { this.Heartbeat = 10 }
+        let n: int = this.Store.CloseStale("recovered")
+        this.Store.AddEvent(0, -1, "ServiceStart", now, Tracker.LocationKey(), "app")
+        if (n > 0) { Console.WriteLine("closed " + String_FromInt(n) + " interval(s) left open by a previous run") }
+        if (this.Dev) {
+            let me: int = this.UserFromIdentity(this.Me, now)
+            this.Store.OpenInterval(me, now, "DevStart", Tracker.LocationKey())
+        } else {
+            this.reconcile(now, "Start")
+        }
+        this.LastTick = now
+    }
+
+    // One pass of the capture loop: drain events, heartbeat when due.
+    public void Tick() {
+        let events: List<ServiceEvent> = Service.PollEvents()
+        for i in 0..events.Count() {
+            let e: ServiceEvent = events.Get(i)
+            this.Handle(e)
+        }
+        let now: int = Tracker.Now()
+        if (now - this.LastTick < this.Heartbeat) { return }
+        let gap: int = TimeCalc.Max(300, this.Heartbeat * 3)
+        if (now - this.LastTick > gap) {
+            // We were not running (frozen VM, sleep without event):
+            // presence can't be vouched for after the last tick.
+            this.Store.CloseAllOpen(this.LastTick, "gap")
+            this.Store.AddEvent(0, -1, "Gap", this.LastTick, "", "app")
+        }
+        this.reconcile(now, "Heartbeat")
+        let open: List<int> = this.Store.OpenUsers()
+        for j in 0..open.Count() {
+            this.Store.Touch(open.Get(j), now)
+            this.checkNotifications(open.Get(j), now)
+        }
+        this.LastTick = now
+    }
+
+    public void Stop() {
+        let now: int = Tracker.Now()
+        this.Store.CloseAllOpen(now, "Stop")
+        this.Store.AddEvent(0, -1, "ServiceStop", now, "", "app")
+    }
+
+    // ── notifications ─────────────────────────────────
+
+    // Back from a long absence (meeting, lunch…): offer to qualify it.
+    // Same day only — an overnight gap is not an absence.
+    public void askAboutAbsence(userId: int, leftAt: int, backAt: int) {
+        if (leftAt <= 0) { return }
+        // Personal mode (evening at home…): nothing to qualify.
+        if (this.Store.ProjectAt(userId, backAt) == -1) { return }
+        let prefs: Prefs = Prefs.Load(this.Store, userId)
+        if (!prefs.AskOnReturn) { return }
+        if (backAt - leftAt < prefs.AbsenceMin * 60) { return }
+        let day: string = Day.Of(backAt)
+        if (Day.Of(leftAt) != day) { return }
+        let mins: int = (backAt - leftAt) / 60
+        let msg: string = "Absent de " + Day.Hm(leftAt) + " à " + Day.Hm(backAt) + " (" + String_FromInt(mins / 60) + " h "
+            + Day.Pad2(mins % 60) + "). Réunion, repas ? Cliquez pour le préciser."
+        this.Notify(userId, "Logonoff — absence à qualifier", msg, prefs.NotifyHow, this.Url("#day/" + day))
+    }
+
+    public string Url(fragment: string) {
+        return "http://127.0.0.1:" + String_FromInt(this.Port) + "/" + fragment
+    }
+
+    public void checkNotifications(userId: int, now: int) {
+        if (this.Store.ProjectAt(userId, now) == -1) { return }
+        let prefs: Prefs = Prefs.Load(this.Store, userId)
+        if (prefs.NotifyMode == "off") { return }
+        let today: string = Day.Of(now)
+        if (prefs.TargetSeconds(today) <= 0) { return }
+        let rem: int = TimeCalc.Remaining(this.Store, prefs, userId, now)
+        if (rem <= 0) {
+            if (this.Store.MarkNotified(userId, today, "done")) {
+                var what: string = "Objectif de la semaine atteint"
+                if (prefs.NotifyMode == "day") { what = "Objectif du jour atteint" }
+                this.Notify(userId, "Logonoff — fin de journée", what + " : tu peux partir.", prefs.NotifyHow, this.Url("#today"))
+            }
+        } else if (prefs.NotifyAhead > 0 && rem <= prefs.NotifyAhead * 60) {
+            if (this.Store.MarkNotified(userId, today, "ahead")) {
+                let mins: int = (rem + 59) / 60
+                this.Notify(userId, "Logonoff", "Plus que " + String_FromInt(mins) + " min avant la fin de journée (" + Day.Hm(now + rem) + ").", prefs.NotifyHow, this.Url("#today"))
+            }
+        }
+    }
+
+    // Deliver to every session of the user. From the service: a toast
+    // through a short-lived `logonoff --notify` started in the
+    // session, or a message box; in console / dev mode the process
+    // already runs on the user's desktop.
+    public void Notify(userId: int, title: string, message: string, how: string, url: string) {
+        if (this.Dev || !this.UnderScm) {
+            Platform.ShowBalloon(title, message, 8, url)
+            return
+        }
+        let sessions: List<int> = Service.UserSessions()
+        for i in 0..sessions.Count() {
+            let s: int = sessions.Get(i)
+            if (this.UserForSession(s, Tracker.Now()) != userId) { continue }
+            var sent: bool = false
+            if (how != "message") {
+                let cmd: string = "\"" + this.ExePath + "\" --notify \"" + Tracker.Unquote(title) + "\" \"" + Tracker.Unquote(message) + "\" \"" + Tracker.Unquote(url) + "\""
+                sent = Service.LaunchInSession(s, cmd) > 0
+            }
+            if (!sent) { Service.SendMessage(s, title, message, 60) }
+        }
+    }
+
+    public static string Unquote(s: string) {
+        return String_Replace(s, "\"", "'")
+    }
+}

@@ -1,0 +1,718 @@
+namespace Logonoff
+
+import Amalgame.Collections
+import Amalgame.DateTime
+import Amalgame.Json
+
+// ── Js — tiny JSON writer helpers ─────────────────────
+
+public class Js {
+    public Js() {}
+
+    public static string S(s: string) {
+        return "\"" + Json.EscapeString(s) + "\""
+    }
+
+    public static string I(n: int) {
+        return String_FromInt(n)
+    }
+
+    public static string B(b: bool) {
+        if (b) { return "true" }
+        return "false"
+    }
+
+    // "key":value — `raw` is already JSON.
+    public static string F(key: string, raw: string) {
+        return "\"" + key + "\":" + raw
+    }
+
+    public static string Arr(items: List<string>) {
+        return "[" + String_Join(items, ",") + "]"
+    }
+
+    public static string Obj(fields: List<string>) {
+        return "{" + String_Join(fields, ",") + "}"
+    }
+}
+
+// ── Dates ─────────────────────────────────────────────
+//
+// Days are local-calendar days of the machine ("YYYY-MM-DD"); their
+// bounds are computed with the zone's DST rules, so a day can last
+// 23 or 25 hours.
+
+public class Day {
+    public Day() {}
+
+    public static string Of(epoch: int) {
+        let i: Instant = Instant.FromUnixSeconds(epoch)
+        return i.LocalDate()
+    }
+
+    public static bool Valid(date: string) {
+        if (String_Length(date) != 10) { return false }
+        let parts: List<string> = String_Split(date, "-")
+        if (parts.Count() != 3) { return false }
+        let m: int = String_ToInt(parts.Get(1))
+        let d: int = String_ToInt(parts.Get(2))
+        return String_ToInt(parts.Get(0)) > 1970 && m >= 1 && m <= 12 && d >= 1 && d <= 31
+    }
+
+    // Local midnight starting `date`, shifted by `addDays`.
+    public static int Start(date: string, addDays: int) {
+        let parts: List<string> = String_Split(date, "-")
+        return DateTime.LocalToEpoch(String_ToInt(parts.Get(0)), String_ToInt(parts.Get(1)),
+            String_ToInt(parts.Get(2)) + addDays, 0, 0, 0)
+    }
+
+    public static string Add(date: string, n: int) {
+        // Noon avoids landing on the wrong side of a DST midnight.
+        let parts: List<string> = String_Split(date, "-")
+        let t: int = DateTime.LocalToEpoch(String_ToInt(parts.Get(0)), String_ToInt(parts.Get(1)),
+            String_ToInt(parts.Get(2)) + n, 12, 0, 0)
+        return Day.Of(t)
+    }
+
+    // ISO weekday, 1 = Monday … 7 = Sunday.
+    public static int Weekday(date: string) {
+        let i: Instant = Instant.FromUnixSeconds(Day.Start(date, 0) + 43200)
+        let p: List<int> = i.LocalParts()
+        return p.Get(7)
+    }
+
+    public static string Monday(date: string) {
+        return Day.Add(date, 1 - Day.Weekday(date))
+    }
+
+    // Local "HH:MM" of an epoch.
+    public static string Hm(epoch: int) {
+        let i: Instant = Instant.FromUnixSeconds(epoch)
+        let p: List<int> = i.LocalParts()
+        return Day.Pad2(p.Get(3)) + ":" + Day.Pad2(p.Get(4))
+    }
+
+    public static string Pad2(n: int) {
+        if (n < 10) { return "0" + String_FromInt(n) }
+        return String_FromInt(n)
+    }
+
+    // -1 / 0 / 1 like strcmp, for "YYYY-MM-DD" strings (fixed width,
+    // so lexical order is date order).
+    public static int Compare(a: string, b: string) {
+        @c { int c = strcmp(a, b); return c < 0 ? -1 : (c > 0 ? 1 : 0); }
+    }
+
+    // Epoch of local `date` at `minutes` after midnight (wall clock,
+    // so DST days are handled).
+    public static int AtMinutes(date: string, minutes: int) {
+        let parts: List<string> = String_Split(date, "-")
+        return DateTime.LocalToEpoch(String_ToInt(parts.Get(0)), String_ToInt(parts.Get(1)),
+            String_ToInt(parts.Get(2)), minutes / 60, minutes % 60, 0)
+    }
+
+    // Epoch of local `date` at "HH:MM" (or "HH:MM:SS"); -1 if malformed.
+    public static int At(date: string, hm: string) {
+        let t: List<string> = String_Split(hm, ":")
+        if (t.Count() < 2) { return -1 }
+        let h: int = String_ToInt(t.Get(0))
+        let m: int = String_ToInt(t.Get(1))
+        var s: int = 0
+        if (t.Count() > 2) { s = String_ToInt(t.Get(2)) }
+        if (h < 0 || h > 24 || m < 0 || m > 59 || s < 0 || s > 59) { return -1 }
+        let parts: List<string> = String_Split(date, "-")
+        return DateTime.LocalToEpoch(String_ToInt(parts.Get(0)), String_ToInt(parts.Get(1)),
+            String_ToInt(parts.Get(2)), h, m, s)
+    }
+}
+
+// ── User settings with defaults ───────────────────────
+
+public class Prefs {
+    public Targets:     List<int>   // minutes, index 0 = Monday
+    public LunchMin:    int         // minimum lunch break (minutes), 0 = off
+    public LunchAfter:  int         // only when more than this many minutes worked
+    public LunchFrom:   int         // lunch window, minutes after midnight
+    public LunchTo:     int
+    public NotifyMode:  string      // "week" | "day" | "off"
+    public NotifyHow:   string      // "toast" | "message"
+    public NotifyAhead: int         // minutes of advance warning, 0 = none
+    public AbsenceMin:  int         // gaps at least this long (minutes) are "to qualify"
+    public AskOnReturn: bool        // notify on return from such an absence
+    public OutsideMode: string      // "count" | "perso": presence outside work hours
+    public LunchAvgDays: int        // lunches averaged for the end-of-day estimate
+    public WorkFrom:    int         // work hours, minutes after midnight
+    public WorkTo:      int
+
+    public Prefs() {
+        this.Targets     = new List<int>()
+        this.LunchMin    = 0
+        this.LunchAfter  = 360
+        this.LunchFrom   = 660
+        this.LunchTo     = 900
+        this.NotifyMode  = "week"
+        this.NotifyHow   = "toast"
+        this.NotifyAhead = 10
+        this.AbsenceMin  = 15
+        this.AskOnReturn = true
+        this.OutsideMode = "count"
+        this.LunchAvgDays = 10
+        this.WorkFrom    = 420
+        this.WorkTo      = 1200
+    }
+
+    // Defaults mirror the C# version: 8h15 Monday–Thursday, 4h Friday.
+    public static string DefaultTarget(weekday: int) {
+        if (weekday <= 4) { return "495" }
+        if (weekday == 5) { return "240" }
+        return "0"
+    }
+
+    public static string Scope(userId: int) {
+        return "user:" + String_FromInt(userId)
+    }
+
+    public static Prefs Load(store: Store, userId: int) {
+        let p = new Prefs()
+        let scope: string = Prefs.Scope(userId)
+        for wd in 1..8 {
+            let v: string = store.Setting(scope, "target_" + String_FromInt(wd), Prefs.DefaultTarget(wd))
+            p.Targets.Add(String_ToInt(v))
+        }
+        p.LunchMin    = String_ToInt(store.Setting(scope, "lunch_min", "0"))
+        p.LunchAfter  = String_ToInt(store.Setting(scope, "lunch_after", "360"))
+        p.LunchFrom   = String_ToInt(store.Setting(scope, "lunch_from", "660"))
+        p.LunchTo     = String_ToInt(store.Setting(scope, "lunch_to", "900"))
+        p.NotifyMode  = store.Setting(scope, "notify_mode", "week")
+        p.NotifyHow   = store.Setting(scope, "notify_how", "toast")
+        p.NotifyAhead = String_ToInt(store.Setting(scope, "notify_ahead", "10"))
+        p.AbsenceMin  = String_ToInt(store.Setting(scope, "absence_min", "15"))
+        p.AskOnReturn = store.Setting(scope, "ask_on_return", "1") == "1"
+        p.OutsideMode = store.Setting(scope, "outside_mode", "count")
+        p.LunchAvgDays = String_ToInt(store.Setting(scope, "lunch_avg_days", "10"))
+        p.WorkFrom    = String_ToInt(store.Setting(scope, "work_from", "420"))
+        p.WorkTo      = String_ToInt(store.Setting(scope, "work_to", "1200"))
+        return p
+    }
+
+    public int TargetSeconds(date: string) {
+        return this.Targets.Get(Day.Weekday(date) - 1) * 60
+    }
+}
+
+// ── Day report ────────────────────────────────────────
+
+public class DayReport {
+    public Date:        string
+    public Start:       int
+    public End:         int
+    public Raw:         int            // presence seconds inside the day
+    public Deduction:   int            // lunch deduction
+    public Worked:      int            // Raw - Deduction
+    public Target:      int
+    public LongestGap:  int            // longest break starting in the lunch window
+    public LunchDeclared: int          // seconds of declared "repas" breaks
+    public Personal:    int            // presence not counted (perso mode, perso tag, outside hours)
+    public OutsidePerso: bool          // outside [WinFrom, WinTo) is personal unless forced
+    public WinFrom:     int
+    public WinTo:       int
+    public Breaks:      List<List<string>>   // declared breaks [id, start, end, kind]
+    public Overridden:  bool           // ProjectIds/Secs come from a manual split
+    public AutoIds:     List<int>      // computed split (kept when overridden)
+    public AutoSecs:    List<int>
+    public PendStarts:  List<int>      // absences still to qualify
+    public PendEnds:    List<int>
+    public First:       int            // first presence (0 = none)
+    public Last:        int            // last presence end (now if open)
+    public Open:        bool
+    public Pieces:      List<List<string>>   // interval rows clipped to the day
+    public ProjectIds:  List<int>
+    public ProjectSecs: List<int>
+
+    public DayReport() {
+        this.Date = ""
+        this.Start = 0
+        this.End = 0
+        this.Raw = 0
+        this.Deduction = 0
+        this.Worked = 0
+        this.Target = 0
+        this.LongestGap = 0
+        this.LunchDeclared = 0
+        this.Personal = 0
+        this.OutsidePerso = false
+        this.WinFrom = 0
+        this.WinTo = 0
+        this.Breaks = new List<List<string>>()
+        this.Overridden = false
+        this.AutoIds = new List<int>()
+        this.AutoSecs = new List<int>()
+        this.PendStarts = new List<int>()
+        this.PendEnds = new List<int>()
+        this.First = 0
+        this.Last = 0
+        this.Open = false
+        this.Pieces = new List<List<string>>()
+        this.ProjectIds = new List<int>()
+        this.ProjectSecs = new List<int>()
+    }
+
+    public void addProject(pid: int, secs: int) {
+        if (secs <= 0) { return }
+        for i in 0..this.ProjectIds.Count() {
+            if (this.ProjectIds.Get(i) == pid) {
+                let cur: int = this.ProjectSecs.Get(i)
+                this.ProjectSecs.RemoveAt(i)
+                this.ProjectIds.RemoveAt(i)
+                this.ProjectIds.Add(pid)
+                this.ProjectSecs.Add(cur + secs)
+                return
+            }
+        }
+        this.ProjectIds.Add(pid)
+        this.ProjectSecs.Add(secs)
+    }
+
+    public int ProjectSeconds(pid: int) {
+        for i in 0..this.ProjectIds.Count() {
+            if (this.ProjectIds.Get(i) == pid) { return this.ProjectSecs.Get(i) }
+        }
+        return 0
+    }
+}
+
+public class TimeCalc {
+    public TimeCalc() {}
+
+    public static int Min(a: int, b: int) {
+        if (a < b) { return a }
+        return b
+    }
+
+    public static int Max(a: int, b: int) {
+        if (a > b) { return a }
+        return b
+    }
+
+    // Presence, project split and lunch deduction for one local day.
+    // Open intervals count up to `now`.
+    public static DayReport ForDay(store: Store, prefs: Prefs, userId: int, date: string, now: int) {
+        let r = new DayReport()
+        r.Date   = date
+        r.Start  = Day.Start(date, 0)
+        r.End    = Day.Start(date, 1)
+        r.Target = prefs.TargetSeconds(date)
+
+        let rows: List<List<string>> = store.Intervals(userId, r.Start, r.End)
+        let switches: List<List<string>> = store.Switches(userId, r.Start, r.End)
+        r.Breaks = store.Breaks(userId, r.Start, r.End)
+        let gapStarts = new List<int>()
+        let gapEnds = new List<int>()
+        var prevEnd: int = 0
+        let lunchFrom: int = Day.AtMinutes(date, prefs.LunchFrom)
+        let lunchTo: int = Day.AtMinutes(date, prefs.LunchTo)
+        // "Outside working hours = personal": a day without target has
+        // no working hours at all.
+        if (prefs.OutsideMode == "perso") {
+            r.OutsidePerso = true
+            if (r.Target > 0) {
+                r.WinFrom = Day.AtMinutes(date, prefs.WorkFrom)
+                r.WinTo = Day.AtMinutes(date, prefs.WorkTo)
+            } else {
+                r.WinFrom = r.Start
+                r.WinTo = r.Start
+            }
+        }
+        for i in 0..rows.Count() {
+            let row: List<string> = rows.Get(i)
+            let s0: int = String_ToInt(row.Get(1))
+            let endS: string = row.Get(2)
+            var e0: int = now
+            if (String_Length(endS) > 0) { e0 = String_ToInt(endS) } else { r.Open = true }
+            let s: int = TimeCalc.Max(s0, r.Start)
+            let e: int = TimeCalc.Min(TimeCalc.Min(e0, r.End), TimeCalc.Max(now, s))
+            if (e <= s) { continue }
+            if (r.First == 0) { r.First = s }
+            // Count the union of the intervals: an edit or a manual
+            // entry may overlap another one; only the uncovered part
+            // of this piece adds time.
+            let cs: int = TimeCalc.Max(s, prevEnd)
+            if (e > cs) {
+                let act: string = row.Get(7)
+                if (act == "perso") {
+                    r.Personal = r.Personal + (e - cs)
+                } else {
+                    // Any typed activity (meeting, urgence…) is work even
+                    // in personal mode or outside working hours.
+                    let force: bool = act != "poste" && act != ""
+                    // A pinned project (meeting typed for project X) wins
+                    // over the switch timeline.
+                    let pinned: int = String_ToInt(row.Get(8))
+                    if (pinned > 0) {
+                        TimeCalc.count(r, pinned, cs, e, true)
+                    } else {
+                        TimeCalc.splitByProject(r, switches, cs, e, force)
+                    }
+                }
+            }
+            if (prevEnd > 0 && s > prevEnd) {
+                gapStarts.Add(prevEnd)
+                gapEnds.Add(s)
+            }
+            // Only a break starting inside the lunch window counts as
+            // the lunch break (not the evening gap before a late session).
+            if (prevEnd > 0 && s > prevEnd && prevEnd >= lunchFrom && prevEnd < lunchTo) {
+                r.LongestGap = TimeCalc.Max(r.LongestGap, s - prevEnd)
+            }
+            prevEnd = TimeCalc.Max(prevEnd, e)
+            r.Last = TimeCalc.Max(r.Last, e)
+            let piece = new List<string>()
+            piece.Add(row.Get(0))
+            piece.Add(String_FromInt(s))
+            piece.Add(String_FromInt(e))
+            piece.Add(endS)
+            piece.Add(row.Get(3))
+            piece.Add(row.Get(4))
+            piece.Add(row.Get(5))
+            piece.Add(row.Get(6))
+            piece.Add(row.Get(7))
+            piece.Add(row.Get(8))
+            piece.Add(row.Get(9))
+            r.Pieces.Add(piece)
+        }
+
+        // Declared lunch, clipped to the day.
+        for b in 0..r.Breaks.Count() {
+            let br: List<string> = r.Breaks.Get(b)
+            if (br.Get(3) == "repas") {
+                let bs: int = TimeCalc.Max(String_ToInt(br.Get(1)), r.Start)
+                let be: int = TimeCalc.Min(String_ToInt(br.Get(2)), r.End)
+                if (be > bs) { r.LunchDeclared = r.LunchDeclared + (be - bs) }
+            }
+        }
+
+        // Absences to qualify: gaps between presence pieces, minus the
+        // declared breaks, at least AbsenceMin long.
+        let minGap: int = TimeCalc.Max(prefs.AbsenceMin, 1) * 60
+        for g in 0..gapStarts.Count() {
+            var cursor: int = gapStarts.Get(g)
+            let gEnd: int = gapEnds.Get(g)
+            for b2 in 0..r.Breaks.Count() {
+                let br2: List<string> = r.Breaks.Get(b2)
+                let bs2: int = String_ToInt(br2.Get(1))
+                let be2: int = String_ToInt(br2.Get(2))
+                if (be2 <= cursor || bs2 >= gEnd) { continue }
+                if (bs2 - cursor >= minGap) {
+                    r.PendStarts.Add(cursor)
+                    r.PendEnds.Add(bs2)
+                }
+                cursor = TimeCalc.Max(cursor, be2)
+            }
+            if (gEnd - cursor >= minGap) {
+                r.PendStarts.Add(cursor)
+                r.PendEnds.Add(gEnd)
+            }
+        }
+
+        if (prefs.LunchMin > 0 && r.Raw > prefs.LunchAfter * 60) {
+            let need: int = prefs.LunchMin * 60
+            // A declared lunch is the truth; otherwise guess from the gaps.
+            var lunch: int = r.LongestGap
+            if (r.LunchDeclared > 0) { lunch = r.LunchDeclared }
+            if (lunch < need) {
+                r.Deduction = TimeCalc.Min(need - lunch, r.Raw)
+            }
+        }
+        r.Worked = r.Raw - r.Deduction
+
+        // A manual split replaces the computed one; the computed one is
+        // kept alongside for display.
+        let alloc: List<List<string>> = store.Allocations(userId, date)
+        if (alloc.Count() > 0) {
+            r.Overridden = true
+            r.AutoIds = r.ProjectIds
+            r.AutoSecs = r.ProjectSecs
+            r.ProjectIds = new List<int>()
+            r.ProjectSecs = new List<int>()
+            for a in 0..alloc.Count() {
+                let ar: List<string> = alloc.Get(a)
+                r.ProjectIds.Add(String_ToInt(ar.Get(0)))
+                r.ProjectSecs.Add(String_ToInt(ar.Get(1)))
+            }
+        }
+        return r
+    }
+
+    // Attribute [s, e) to the projects in force, walking the switch
+    // timeline (oldest first; the first row may predate the day).
+    static void splitByProject(r: DayReport, switches: List<List<string>>, s: int, e: int, force: bool) {
+        var cursor: int = s
+        var current: int = 0
+        var k: int = 0
+        let n: int = switches.Count()
+        // Project in force at `s`.
+        while (k < n) {
+            let sw: List<string> = switches.Get(k)
+            if (String_ToInt(sw.Get(2)) > s) { break }
+            current = String_ToInt(sw.Get(1))
+            k = k + 1
+        }
+        while (k < n) {
+            let sw2: List<string> = switches.Get(k)
+            let at: int = String_ToInt(sw2.Get(2))
+            if (at >= e) { break }
+            TimeCalc.count(r, current, cursor, at, force)
+            cursor = at
+            current = String_ToInt(sw2.Get(1))
+            k = k + 1
+        }
+        TimeCalc.count(r, current, cursor, e, force)
+    }
+
+    // Count [s, e) for project `pid` (-1 = personal mode), or as
+    // personal time: personal mode, or outside working hours when that
+    // rule is on — unless `force` (a typed work activity).
+    static void count(r: DayReport, pid: int, s: int, e: int, force: bool) {
+        if (e <= s) { return }
+        var p: int = pid
+        if (p < 0) {
+            if (!force) {
+                r.Personal = r.Personal + (e - s)
+                return
+            }
+            p = 0
+        }
+        var inside: int = e - s
+        if (!force && r.OutsidePerso) {
+            let a: int = TimeCalc.Max(s, r.WinFrom)
+            let b: int = TimeCalc.Min(e, r.WinTo)
+            inside = TimeCalc.Max(0, b - a)
+        }
+        r.Personal = r.Personal + (e - s) - inside
+        r.Raw = r.Raw + inside
+        r.addProject(p, inside)
+    }
+
+    // JSON for a day: totals, pieces, per-project seconds.
+    public static string DayJson(r: DayReport, store: Store, userId: int) {
+        let pieces = new List<string>()
+        for i in 0..r.Pieces.Count() {
+            let p: List<string> = r.Pieces.Get(i)
+            let f = new List<string>()
+            f.Add(Js.F("id", p.Get(0)))
+            f.Add(Js.F("start", p.Get(1)))
+            f.Add(Js.F("end", p.Get(2)))
+            f.Add(Js.F("open", Js.B(String_Length(p.Get(3)) == 0)))
+            f.Add(Js.F("startHm", Js.S(Day.Hm(String_ToInt(p.Get(1))))))
+            f.Add(Js.F("endHm", Js.S(Day.Hm(String_ToInt(p.Get(2))))))
+            f.Add(Js.F("startReason", Js.S(p.Get(4))))
+            f.Add(Js.F("endReason", Js.S(p.Get(5))))
+            f.Add(Js.F("location", Js.S(p.Get(6))))
+            f.Add(Js.F("manual", Js.B(p.Get(7) == "1")))
+            f.Add(Js.F("activity", Js.S(p.Get(8))))
+            f.Add(Js.F("projectId", Js.I(String_ToInt(p.Get(9)))))
+            f.Add(Js.F("note", Js.S(p.Get(10))))
+            pieces.Add(Js.Obj(f))
+        }
+        let breaks = new List<string>()
+        for b in 0..r.Breaks.Count() {
+            let br: List<string> = r.Breaks.Get(b)
+            let fb = new List<string>()
+            fb.Add(Js.F("id", br.Get(0)))
+            fb.Add(Js.F("kind", Js.S(br.Get(3))))
+            fb.Add(Js.F("startHm", Js.S(Day.Hm(String_ToInt(br.Get(1))))))
+            fb.Add(Js.F("endHm", Js.S(Day.Hm(String_ToInt(br.Get(2))))))
+            fb.Add(Js.F("seconds", Js.I(String_ToInt(br.Get(2)) - String_ToInt(br.Get(1)))))
+            breaks.Add(Js.Obj(fb))
+        }
+        let pending = new List<string>()
+        for g in 0..r.PendStarts.Count() {
+            let fp = new List<string>()
+            fp.Add(Js.F("start", Js.I(r.PendStarts.Get(g))))
+            fp.Add(Js.F("end", Js.I(r.PendEnds.Get(g))))
+            fp.Add(Js.F("startHm", Js.S(Day.Hm(r.PendStarts.Get(g)))))
+            fp.Add(Js.F("endHm", Js.S(Day.Hm(r.PendEnds.Get(g)))))
+            fp.Add(Js.F("seconds", Js.I(r.PendEnds.Get(g) - r.PendStarts.Get(g))))
+            pending.Add(Js.Obj(fp))
+        }
+        let projects: List<List<string>> = store.Projects(userId, true)
+        let per: List<string> = TimeCalc.projectRows(projects, r.ProjectIds, r.ProjectSecs)
+        var autoRows: List<string> = TimeCalc.projectRows(projects, r.AutoIds, r.AutoSecs)
+        if (!r.Overridden) { autoRows = per }
+        let o = new List<string>()
+        o.Add(Js.F("date", Js.S(r.Date)))
+        return TimeCalc.dayJsonRest(r, o, pieces, breaks, pending, per, autoRows)
+    }
+
+    static List<string> projectRows(projects: List<List<string>>, ids: List<int>, secs: List<int>) {
+        let per = new List<string>()
+        for j in 0..ids.Count() {
+            let pid: int = ids.Get(j)
+            var code: string = ""
+            var label: string = "Sans projet"
+            for k in 0..projects.Count() {
+                let pr: List<string> = projects.Get(k)
+                if (String_ToInt(pr.Get(0)) == pid) {
+                    code = pr.Get(1)
+                    label = pr.Get(2)
+                }
+            }
+            let f2 = new List<string>()
+            f2.Add(Js.F("projectId", Js.I(pid)))
+            f2.Add(Js.F("code", Js.S(code)))
+            f2.Add(Js.F("label", Js.S(label)))
+            f2.Add(Js.F("seconds", Js.I(secs.Get(j))))
+            per.Add(Js.Obj(f2))
+        }
+        return per
+    }
+
+    static string dayJsonRest(r: DayReport, o: List<string>, pieces: List<string>, breaks: List<string>,
+                              pending: List<string>, per: List<string>, autoRows: List<string>) {
+        o.Add(Js.F("weekday", Js.I(Day.Weekday(r.Date))))
+        o.Add(Js.F("raw", Js.I(r.Raw)))
+        o.Add(Js.F("personal", Js.I(r.Personal)))
+        o.Add(Js.F("deduction", Js.I(r.Deduction)))
+        o.Add(Js.F("worked", Js.I(r.Worked)))
+        o.Add(Js.F("target", Js.I(r.Target)))
+        o.Add(Js.F("longestBreak", Js.I(r.LongestGap)))
+        o.Add(Js.F("lunchDeclared", Js.I(r.LunchDeclared)))
+        o.Add(Js.F("breaks", Js.Arr(breaks)))
+        o.Add(Js.F("pending", Js.Arr(pending)))
+        o.Add(Js.F("open", Js.B(r.Open)))
+        var firstHm: string = ""
+        var lastHm: string = ""
+        if (r.First > 0) {
+            firstHm = Day.Hm(r.First)
+            lastHm = Day.Hm(r.Last)
+        }
+        o.Add(Js.F("firstHm", Js.S(firstHm)))
+        o.Add(Js.F("lastHm", Js.S(lastHm)))
+        o.Add(Js.F("intervals", Js.Arr(pieces)))
+        o.Add(Js.F("projects", Js.Arr(per)))
+        o.Add(Js.F("overridden", Js.B(r.Overridden)))
+        o.Add(Js.F("autoProjects", Js.Arr(autoRows)))
+        return Js.Obj(o)
+    }
+
+    // Week summary for the week containing `date`. `balance` compares
+    // worked time with the targets of the days up to today included;
+    // `remainingToday` is what is left to reach the target to date and
+    // `endHm` the clock time it will be reached if presence goes on.
+    public static string WeekJson(store: Store, prefs: Prefs, userId: int, date: string, now: int) {
+        let monday: string = Day.Monday(date)
+        let today: string = Day.Of(now)
+        let days = new List<string>()
+        var worked: int = 0
+        var target: int = 0
+        var workedToDate: int = 0
+        var targetToDate: int = 0
+        var openToday: bool = false
+        var todayLunch: int = 0
+        for i in 0..7 {
+            let d: string = Day.Add(monday, i)
+            let r: DayReport = TimeCalc.ForDay(store, prefs, userId, d, now)
+            worked = worked + r.Worked
+            target = target + r.Target
+            if (Day.Compare(d, today) <= 0) {
+                workedToDate = workedToDate + r.Worked
+                targetToDate = targetToDate + r.Target
+            }
+            if (d == today) {
+                openToday = r.Open
+                todayLunch = TimeCalc.LunchOf(r)
+            }
+            let f = new List<string>()
+            f.Add(Js.F("date", Js.S(d)))
+            f.Add(Js.F("weekday", Js.I(i + 1)))
+            f.Add(Js.F("worked", Js.I(r.Worked)))
+            f.Add(Js.F("target", Js.I(r.Target)))
+            f.Add(Js.F("deduction", Js.I(r.Deduction)))
+            f.Add(Js.F("pending", Js.I(r.PendStarts.Count())))
+            f.Add(Js.F("personal", Js.I(r.Personal)))
+            var firstHm: string = ""
+            var lastHm: string = ""
+            if (r.First > 0) {
+                firstHm = Day.Hm(r.First)
+                lastHm = Day.Hm(r.Last)
+            }
+            f.Add(Js.F("firstHm", Js.S(firstHm)))
+            f.Add(Js.F("lastHm", Js.S(lastHm)))
+            days.Add(Js.Obj(f))
+        }
+        let remaining: int = targetToDate - workedToDate
+        // Lunch still ahead today: the clock time to leave includes it.
+        var lunchAhead: int = 0
+        if (remaining > 0 && openToday && todayLunch == 0 && now < Day.AtMinutes(today, prefs.LunchTo)) {
+            lunchAhead = TimeCalc.ExpectedLunch(store, prefs, userId, today, now)
+        }
+        var endHm: string = ""
+        if (remaining > 0 && openToday) { endHm = Day.Hm(now + remaining + lunchAhead) }
+        let o = new List<string>()
+        o.Add(Js.F("monday", Js.S(monday)))
+        o.Add(Js.F("worked", Js.I(worked)))
+        o.Add(Js.F("target", Js.I(target)))
+        o.Add(Js.F("workedToDate", Js.I(workedToDate)))
+        o.Add(Js.F("targetToDate", Js.I(targetToDate)))
+        o.Add(Js.F("balance", Js.I(workedToDate - targetToDate)))
+        o.Add(Js.F("remainingToday", Js.I(remaining)))
+        o.Add(Js.F("endHm", Js.S(endHm)))
+        o.Add(Js.F("lunchAhead", Js.I(lunchAhead)))
+        o.Add(Js.F("present", Js.B(openToday)))
+        o.Add(Js.F("days", Js.Arr(days)))
+        return Js.Obj(o)
+    }
+
+    // Lunch taken on a day: declared "repas" breaks, else the longest
+    // break started in the lunch window if it lasted at least 20 min.
+    // 0 = no lunch (yet).
+    public static int LunchOf(r: DayReport) {
+        if (r.LunchDeclared > 0) { return r.LunchDeclared }
+        if (r.LongestGap >= 1200) { return r.LongestGap }
+        return 0
+    }
+
+    // Expected lunch length: mean of the last `LunchAvgDays` worked
+    // days (before `today`) where a lunch was seen, looking back at most
+    // 60 days; never below the configured minimum lunch. 0 when no
+    // history and no minimum.
+    public static int ExpectedLunch(store: Store, prefs: Prefs, userId: int, today: string, now: int) {
+        var sum: int = 0
+        var n: int = 0
+        var d: string = Day.Add(today, -1)
+        var back: int = 0
+        let want: int = TimeCalc.Max(1, prefs.LunchAvgDays)
+        while (n < want && back < 60) {
+            let r: DayReport = TimeCalc.ForDay(store, prefs, userId, d, now)
+            let l: int = TimeCalc.LunchOf(r)
+            if (r.Target > 0 && l > 0) {
+                sum = sum + l
+                n = n + 1
+            }
+            d = Day.Add(d, -1)
+            back = back + 1
+        }
+        var avg: int = 0
+        if (n > 0) { avg = sum / n }
+        return TimeCalc.Max(avg, prefs.LunchMin * 60)
+    }
+
+    // Seconds still to work (≤ 0 when reached) for the notification
+    // mode: "day" = today's target, "week" = targets to date.
+    public static int Remaining(store: Store, prefs: Prefs, userId: int, now: int) {
+        let today: string = Day.Of(now)
+        if (prefs.NotifyMode == "day") {
+            let r: DayReport = TimeCalc.ForDay(store, prefs, userId, today, now)
+            return r.Target - r.Worked
+        }
+        let monday: string = Day.Monday(today)
+        var left: int = 0
+        var d: string = monday
+        while (Day.Compare(d, today) <= 0) {
+            let r2: DayReport = TimeCalc.ForDay(store, prefs, userId, d, now)
+            left = left + r2.Target - r2.Worked
+            d = Day.Add(d, 1)
+        }
+        return left
+    }
+}
