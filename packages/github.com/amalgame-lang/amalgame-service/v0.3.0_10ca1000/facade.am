@@ -898,6 +898,40 @@ public class Service {
         }
     }
 
+    // Make the SCM restart service `name` when it crashes: after
+    // `delayMs`, twice, then after 12 × `delayMs`; the failure count
+    // resets after `resetSeconds` without failure. Call it from the
+    // service itself (LocalSystem may reconfigure its own service).
+    // Installers' failure-action tables (MSI MsiServiceConfigFailure-
+    // Actions) are fragile — error 1939 aborts the whole install.
+    // False on POSIX or when the service can't be opened.
+    public static bool SetRestartOnFailure(name: string, delayMs: int, resetSeconds: int) {
+        @c {
+        #ifdef _WIN32
+            SC_HANDLE scm = OpenSCManagerA(NULL, NULL, SC_MANAGER_CONNECT);
+            if (!scm) return 0;
+            SC_HANDLE svc = OpenServiceA(scm, name, SERVICE_CHANGE_CONFIG | SERVICE_START);
+            if (!svc) { CloseServiceHandle(scm); return 0; }
+            SC_ACTION acts[3];
+            acts[0].Type = SC_ACTION_RESTART; acts[0].Delay = (DWORD) delayMs;
+            acts[1].Type = SC_ACTION_RESTART; acts[1].Delay = (DWORD) delayMs;
+            acts[2].Type = SC_ACTION_RESTART; acts[2].Delay = (DWORD) (delayMs * 12);
+            SERVICE_FAILURE_ACTIONSA fa;
+            ZeroMemory(&fa, sizeof(fa));
+            fa.dwResetPeriod = (DWORD) resetSeconds;
+            fa.cActions = 3;
+            fa.lpsaActions = acts;
+            BOOL ok = ChangeServiceConfig2A(svc, SERVICE_CONFIG_FAILURE_ACTIONS, &fa);
+            CloseServiceHandle(svc);
+            CloseServiceHandle(scm);
+            return ok ? 1 : 0;
+        #else
+            (void) name; (void) delayMs; (void) resetSeconds;
+            return 0;
+        #endif
+        }
+    }
+
     // Start `commandLine` as the user logged on to `sessionId`, on
     // their interactive desktop, with their environment block and no
     // console window. This is how a service shows UI (a toast, a

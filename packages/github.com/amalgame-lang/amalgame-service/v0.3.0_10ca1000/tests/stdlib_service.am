@@ -98,6 +98,11 @@ public class Program {
         } else {
             Console.WriteLine("[FAIL] not under scm")
         }
+        if (!Service.SetRestartOnFailure("amalgame-service-no-such-service", 5000, 86400)) {
+            Console.WriteLine("[PASS] restart-on-failure on missing service")
+        } else {
+            Console.WriteLine("[FAIL] restart-on-failure on missing service")
+        }
         let st: string = Service.SessionState(999999)
         let lk: string = Service.SessionLockState(999999)
         if (st == "Unknown" && lk == "Unknown" && Service.SessionUserSid(999999) == ""

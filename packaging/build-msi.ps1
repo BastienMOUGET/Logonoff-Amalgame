@@ -9,8 +9,8 @@
 #   - installs dist\ into %ProgramFiles%\Logonoff;
 #   - stops and deletes any existing "Logonoff" service (the old C#
 #     service, or one created by install.cmd), then installs the
-#     service (LocalSystem, automatic start, "--service"), starts it,
-#     and configures restart-on-failure;
+#     service (LocalSystem, automatic start, "--service") and starts it
+#     (restart-on-failure is set by the service itself at start-up);
 #   - Start menu shortcut "Logonoff" (logonoff.exe --open);
 #   - major upgrade: a newer .msi replaces the installed one;
 #   - uninstall stops and removes the service and the files.
@@ -263,8 +263,7 @@ $schemas = @(
     "CREATE TABLE ``Icon`` (``Name`` CHAR(72) NOT NULL, ``Data`` OBJECT NOT NULL PRIMARY KEY ``Name``)",
     "CREATE TABLE ``Upgrade`` (``UpgradeCode`` CHAR(38) NOT NULL, ``VersionMin`` CHAR(20), ``VersionMax`` CHAR(20), ``Language`` CHAR(255), ``Attributes`` LONG NOT NULL, ``Remove`` CHAR(255), ``ActionProperty`` CHAR(72) NOT NULL PRIMARY KEY ``UpgradeCode``, ``VersionMin``, ``VersionMax``, ``Language``, ``Attributes``)",
     "CREATE TABLE ``ServiceInstall`` (``ServiceInstall`` CHAR(72) NOT NULL, ``Name`` CHAR(255) NOT NULL, ``DisplayName`` CHAR(255) LOCALIZABLE, ``ServiceType`` LONG NOT NULL, ``StartType`` LONG NOT NULL, ``ErrorControl`` LONG NOT NULL, ``LoadOrderGroup`` CHAR(255), ``Dependencies`` CHAR(255), ``StartName`` CHAR(255), ``Password`` CHAR(255), ``Arguments`` CHAR(255), ``Component_`` CHAR(72) NOT NULL, ``Description`` CHAR(255) LOCALIZABLE PRIMARY KEY ``ServiceInstall``)",
-    "CREATE TABLE ``ServiceControl`` (``ServiceControl`` CHAR(72) NOT NULL, ``Name`` CHAR(255) NOT NULL LOCALIZABLE, ``Event`` SHORT NOT NULL, ``Arguments`` CHAR(255) LOCALIZABLE, ``Wait`` SHORT, ``Component_`` CHAR(72) NOT NULL PRIMARY KEY ``ServiceControl``)",
-    "CREATE TABLE ``MsiServiceConfigFailureActions`` (``MsiServiceConfigFailureActions`` CHAR(72) NOT NULL, ``Name`` CHAR(255) NOT NULL LOCALIZABLE, ``Event`` SHORT NOT NULL, ``ResetPeriod`` LONG, ``RebootMessage`` CHAR(255) LOCALIZABLE, ``Command`` CHAR(255) LOCALIZABLE, ``Actions`` CHAR(255), ``DelayActions`` CHAR(255), ``Component_`` CHAR(72) NOT NULL PRIMARY KEY ``MsiServiceConfigFailureActions``)"
+    "CREATE TABLE ``ServiceControl`` (``ServiceControl`` CHAR(72) NOT NULL, ``Name`` CHAR(255) NOT NULL LOCALIZABLE, ``Event`` SHORT NOT NULL, ``Arguments`` CHAR(255) LOCALIZABLE, ``Wait`` SHORT, ``Component_`` CHAR(72) NOT NULL PRIMARY KEY ``ServiceControl``)"
 )
 foreach ($ddl in $schemas) { Exec-Sql $ddl }
 
@@ -343,9 +342,10 @@ Insert-Row "ServiceInstall" @("ServiceInstall", "Name", "DisplayName", "ServiceT
 # 32 stop on uninstall, 128 delete on uninstall.
 Insert-Row "ServiceControl" @("ServiceControl", "Name", "Event", "Arguments", "Wait", "Component_") @(
     "SvcCtlLogonoff", "Logonoff", [int](1 + 2 + 8 + 32 + 128), $null, [int]1, $exe.ComponentId)
-# Restart after 5 s, 5 s, then 60 s; failure counter reset after a day.
-Insert-Row "MsiServiceConfigFailureActions" @("MsiServiceConfigFailureActions", "Name", "Event", "ResetPeriod", "RebootMessage", "Command", "Actions", "DelayActions", "Component_") @(
-    "SvcFailLogonoff", "Logonoff", [int]1, [int]86400, $null, $null, "1[~]1[~]1", "5000[~]5000[~]60000", $exe.ComponentId)
+# Restart-on-failure is NOT set here: the MsiServiceConfigFailureActions
+# table + MsiConfigureServices failed with error 1939 on a real install
+# and rolled everything back. The service configures it for itself at
+# start-up (Service.SetRestartOnFailure).
 
 # -- Icon + Start menu shortcut ----------------------------------------
 $iconView = Invoke-MSI $database "OpenView" @("INSERT INTO ``Icon`` (``Name``, ``Data``) VALUES (?, ?)")
@@ -382,7 +382,6 @@ $execSeq = @(
     @("InstallFiles",            $null, 4000),
     @("CreateShortcuts",         $null, 4500),
     @("InstallServices",         $null, 5800),
-    @("MsiConfigureServices",    $null, 5850),
     @("StartServices",           $null, 5900),
     @("RegisterUser",            $null, 6000),
     @("RegisterProduct",         $null, 6100),

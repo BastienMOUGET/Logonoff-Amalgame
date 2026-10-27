@@ -113,6 +113,12 @@ public class Program {
         }
         if (mode == "--service") {
             Platform.LogToFile(dataDir + Program.Sep() + "logonoff.log")
+            // Restart after 5 s, 5 s, then 60 s; failure count reset daily.
+            if (Service.SetRestartOnFailure("Logonoff", 5000, 86400)) {
+                Platform.Log("redémarrage automatique sur échec : configuré")
+            } else {
+                Platform.Log("redémarrage automatique sur échec : non configuré")
+            }
         }
         Platform.Log("démarrage " + mode + " — données " + dataDir)
         let store: Store = Store.Open(dataDir + Program.Sep() + "logonoff.db")
