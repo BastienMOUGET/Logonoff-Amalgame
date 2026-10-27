@@ -64,8 +64,9 @@ jobs:
       - name: MSI
         shell: pwsh
         run: |
-          $a = @()
-          if ("${{ steps.ver.outputs.version }}") { $a = @("-Version", "${{ steps.ver.outputs.version }}") }
+          # Hashtable splatting: an array would pass "-Version" positionally.
+          $a = @{}
+          if ("${{ steps.ver.outputs.version }}") { $a = @{ Version = "${{ steps.ver.outputs.version }}" } }
           ./packaging/build-msi.ps1 @a
 
       - name: Portable zip
