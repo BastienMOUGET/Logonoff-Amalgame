@@ -10,11 +10,22 @@ import Amalgame.Collections
     #include <time.h>
     #include <string.h>
     #ifdef _WIN32
-        /* Dynamic time-zone API (local-time helpers) is Windows 7+. */
-        #ifndef _WIN32_WINNT
-            #define _WIN32_WINNT 0x0601
-        #endif
         #include <windows.h>
+        /* The *Ex time-zone conversions are Windows 7+, but the Amalgame
+         * runtime includes <windows.h> first with a Vista target, so their
+         * prototypes may be missing (an error with gcc >= 14). Resolve
+         * them from kernel32 at run time instead of relying on headers. */
+        typedef BOOL (WINAPI *Amalgame_DateTime_PFN_TzConv)(const DYNAMIC_TIME_ZONE_INFORMATION*, const SYSTEMTIME*, LPSYSTEMTIME);
+        static Amalgame_DateTime_PFN_TzConv Amalgame_DateTime_UtcToLocal(void) {
+            static Amalgame_DateTime_PFN_TzConv f = NULL;
+            if (!f) f = (Amalgame_DateTime_PFN_TzConv) GetProcAddress(GetModuleHandleA("kernel32.dll"), "SystemTimeToTzSpecificLocalTimeEx");
+            return f;
+        }
+        static Amalgame_DateTime_PFN_TzConv Amalgame_DateTime_LocalToUtc(void) {
+            static Amalgame_DateTime_PFN_TzConv f = NULL;
+            if (!f) f = (Amalgame_DateTime_PFN_TzConv) GetProcAddress(GetModuleHandleA("kernel32.dll"), "TzSpecificLocalTimeToSystemTimeEx");
+            return f;
+        }
     #endif
 }
 
@@ -145,7 +156,8 @@ public class DateTime {
             DYNAMIC_TIME_ZONE_INFORMATION dtz;
             if (GetDynamicTimeZoneInformation(&dtz) == TIME_ZONE_ID_INVALID) return 0;
             if (!FileTimeToSystemTime(&ftUtc, &stUtc)) return 0;
-            if (!SystemTimeToTzSpecificLocalTimeEx(&dtz, &stUtc, &stLoc)) return 0;
+            Amalgame_DateTime_PFN_TzConv toLocal = Amalgame_DateTime_UtcToLocal();
+            if (!toLocal || !toLocal(&dtz, &stUtc, &stLoc)) return 0;
             FILETIME ftLoc;
             if (!SystemTimeToFileTime(&stLoc, &ftLoc)) return 0;
             ULARGE_INTEGER l;
@@ -193,7 +205,8 @@ public class DateTime {
             DYNAMIC_TIME_ZONE_INFORMATION dtz;
             if (GetDynamicTimeZoneInformation(&dtz) == TIME_ZONE_ID_INVALID) return naive;
             if (!FileTimeToSystemTime(&ftNaive, &stLoc)) return naive;
-            if (!TzSpecificLocalTimeToSystemTimeEx(&dtz, &stLoc, &stUtc)) return naive;
+            Amalgame_DateTime_PFN_TzConv toUtc = Amalgame_DateTime_LocalToUtc();
+            if (!toUtc || !toUtc(&dtz, &stLoc, &stUtc)) return naive;
             FILETIME ftUtc;
             if (!SystemTimeToFileTime(&stUtc, &ftUtc)) return naive;
             ULARGE_INTEGER r;
