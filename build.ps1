@@ -85,7 +85,7 @@ foreach ($p in $pkgs) {
     $hash = Get-SourceHash $dir.FullName
     # An old stamp may be empty (Get-Content then returns $null).
     $previous = ""
-    if (Test-Path $stamp) { $previous = ([string](Get-Content $stamp -Raw)).Trim() }
+    if (Test-Path $stamp) { $previous = [System.IO.File]::ReadAllText($stamp).Trim() }
     if ($previous -eq $hash) { continue }
     Remove-Item -Recurse -Force (Join-Path $dir.FullName "build\$plat") -ErrorAction SilentlyContinue
     $log = "build\pkg-$name.log"
