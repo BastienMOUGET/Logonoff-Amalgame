@@ -2,7 +2,7 @@
 // opens the shell instantly. The server is local and always on, so the
 // network is tried first; the cache is just a fallback for the shell.
 // /api/* is never cached (per-user, always live).
-const CACHE = "logonoff-v8";
+const CACHE = "logonoff-v9";
 const SHELL = ["/", "/index.html", "/style.css", "/app.js", "/manifest.webmanifest",
                "/favicon.png", "/icon-192.png", "/icon-512.png"];
 

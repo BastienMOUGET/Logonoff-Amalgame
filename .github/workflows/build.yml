@@ -1,0 +1,93 @@
+name: Build & release
+
+# Every push / PR: build on Windows, produce the MSI and a portable zip as
+# run artifacts. A `v*` tag (e.g. v0.2.0) also publishes a GitHub Release
+# with both files attached; the MSI then carries the tag's version, so it
+# upgrades any older install in place.
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  AMC_VERSION: "0.8.90"
+
+jobs:
+  windows:
+    name: Windows build + MSI
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: true
+          # nghttp2 is not needed: Logonoff doesn't use HTTP/2 and
+          # amalgame-net-http stubs it out without the headers.
+          install: >-
+            mingw-w64-x86_64-gcc
+            mingw-w64-x86_64-gc
+            mingw-w64-x86_64-openssl
+            unzip
+
+      - name: Download amc ${{ env.AMC_VERSION }}
+        shell: msys2 {0}
+        run: |
+          set -e
+          curl -sSL -o amc.zip \
+            "https://github.com/amalgame-lang/Amalgame/releases/download/v${AMC_VERSION}/amc-${AMC_VERSION}-windows-x86_64.zip"
+          dest="$(cygpath -u "$RUNNER_TEMP")/amc"
+          unzip -q amc.zip -d "$dest"
+          echo "AMC=$dest/amc-${AMC_VERSION}-windows-x86_64/bin/amc.exe" >> "$GITHUB_ENV"
+
+      - name: Build (packages offline from packages/, transpile, link)
+        shell: msys2 {0}
+        run: |
+          "$AMC" --version
+          ./build.sh
+
+      - name: Version
+        id: ver
+        shell: pwsh
+        run: |
+          $v = ""
+          if ("${{ github.ref_type }}" -eq "tag") { $v = "${{ github.ref_name }}".TrimStart("v") }
+          "version=$v" >> $env:GITHUB_OUTPUT
+
+      - name: MSI
+        shell: pwsh
+        run: |
+          $a = @()
+          if ("${{ steps.ver.outputs.version }}") { $a = @("-Version", "${{ steps.ver.outputs.version }}") }
+          ./packaging/build-msi.ps1 @a
+
+      - name: Portable zip
+        shell: pwsh
+        run: |
+          $msi = Get-ChildItem dist-msi -Filter *.msi | Select-Object -First 1
+          $name = $msi.BaseName + "-portable.zip"
+          Compress-Archive -Path dist\* -DestinationPath (Join-Path dist-msi $name)
+          Get-ChildItem dist-msi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: logonoff-windows
+          path: |
+            dist-msi/*.msi
+            dist-msi/*.zip
+
+      - name: GitHub Release
+        if: github.ref_type == 'tag'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $files = (Get-ChildItem dist-msi -Include *.msi, *.zip -Recurse).FullName
+          gh release create "${{ github.ref_name }}" @files --title "Logonoff ${{ github.ref_name }}" --generate-notes

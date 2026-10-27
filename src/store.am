@@ -333,14 +333,15 @@ public class Store {
 
     // Typed interval: `activity` poste / reunion / deplacement / autre,
     // `projectId` 0 = follow the switch timeline.
-    public bool AddManualInterval(userId: int, start: int, end: int, activity: string, projectId: int) {
+    public bool AddManualInterval(userId: int, start: int, end: int, activity: string, projectId: int, note: string) {
         Threading.MutexLock(this.Mu)
         var pid: string = ""
         if (projectId > 0) { pid = Store.I(projectId) }
         let ps: List<string> = Store.P5(Store.I(userId), Store.I(start), Store.I(end), Store.I(end), activity)
         ps.Add(pid)
-        let ok: bool = this.x("INSERT INTO intervals (user_id, start_at, end_at, last_seen, start_reason, end_reason, manual, activity, project_id) "
-            + "VALUES (?, ?, ?, ?, 'manual', 'manual', 1, ?, NULLIF(?, ''))", ps)
+        ps.Add(note)
+        let ok: bool = this.x("INSERT INTO intervals (user_id, start_at, end_at, last_seen, start_reason, end_reason, manual, activity, project_id, note) "
+            + "VALUES (?, ?, ?, ?, 'manual', 'manual', 1, ?, NULLIF(?, ''), ?)", ps)
         Threading.MutexUnlock(this.Mu)
         return ok
     }

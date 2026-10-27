@@ -1,6 +1,7 @@
 namespace Logonoff
 
 import Amalgame.Collections
+import Amalgame.Formats.Xlsx
 import Amalgame.Json
 import Amalgame.Net.Http
 import Amalgame.Service
@@ -230,6 +231,7 @@ public class WebServer {
         if (a == "report" && get) { return this.report(c, req, now, false) }
         if (a == "report.csv" && get) { return this.report(c, req, now, true) }
         if (a == "export" && get) { return this.export(c, req, now) }
+        if (a == "report.xlsx" && get) { return this.reportXlsx(c, req, now) }
         if (a == "qualify" && !get) { return this.qualify(c, body, now) }
         if (a == "allocations" && !get) { return this.saveAllocations(c, body) }
         if (a == "breaks" && !get && cc == "delete") {
@@ -565,6 +567,233 @@ public class WebServer {
         }
     }
 
+    // ── Excel report ──────────────────────────────────
+    //
+    // Four sheets over [from, to]: Synthèse (per imputation, with SUM
+    // formulas), Détail (day × imputation), Journées (arrival, departure,
+    // worked vs target), Plages (every presence piece with its note, for
+    // justification). Durations are real Excel times ([h]:mm) so they
+    // add up; hours are also given as decimals for time-sheet tools.
+    public HttpResponse reportXlsx(c: Caller, req: HttpRequest, now: int) {
+        var from: string = WebServer.Q(req, "from")
+        var to: string = WebServer.Q(req, "to")
+        if (!Day.Valid(to)) { to = Day.Of(now) }
+        if (!Day.Valid(from)) { from = Day.Monday(to) }
+        if (Day.Compare(from, to) > 0) { return WebServer.Err(400, "from > to") }
+        let prefs: Prefs = Prefs.Load(this.Store, c.UserId)
+        let projects: List<List<string>> = this.Store.Projects(c.UserId, true)
+        let u: List<string> = this.Store.User(c.UserId)
+        var display: string = c.Account
+        if (u.Count() > 3 && String_Length(u.Get(3)) > 0) { display = u.Get(3) }
+
+        let wb = new XlsxWorkbook()
+        wb.Creator = "Logonoff"
+        let syn: XlsxSheet = wb.AddSheet("Synthèse")
+        let det: XlsxSheet = wb.AddSheet("Détail")
+        let jours: XlsxSheet = wb.AddSheet("Journées")
+        let plages: XlsxSheet = wb.AddSheet("Plages")
+
+        WebServer.headers(det, "Date", "Jour", "Imputation", "Libellé", "Durée", "Heures")
+        WebServer.headers(jours, "Date", "Jour", "Arrivée", "Départ", "Travaillé", "Objectif")
+        jours.Text(1, 7, "Écart (h)", Xlsx.Header())
+        jours.Text(1, 8, "Perso", Xlsx.Header())
+        jours.Text(1, 9, "Pause déduite", Xlsx.Header())
+        WebServer.headers(plages, "Date", "Début", "Fin", "Durée", "Activité", "Imputation")
+        plages.Text(1, 7, "Note", Xlsx.Header())
+
+        // Per-imputation totals for the summary.
+        let sumIds = new List<int>()
+        let sumSecs = new List<int>()
+        let sumDays = new List<int>()
+        var detRow: int = 2
+        var dayRow: int = 2
+        var pieceRow: int = 2
+        var d: string = from
+        var count: int = 0
+        while (Day.Compare(d, to) <= 0 && count < 400) {
+            let r: DayReport = TimeCalc.ForDay(this.Store, prefs, c.UserId, d, now)
+            let parts: List<string> = String_Split(d, "-")
+            let y: int = String_ToInt(parts.Get(0))
+            let mo: int = String_ToInt(parts.Get(1))
+            let da: int = String_ToInt(parts.Get(2))
+            let wd: string = WebServer.DayName(Day.Weekday(d))
+            let secsList = new List<int>()
+            for i in 0..r.ProjectIds.Count() { secsList.Add(r.ProjectSecs.Get(i)) }
+            if (!r.Overridden) { WebServer.applyDeduction(r.ProjectIds, secsList, r.Deduction) }
+            for i in 0..r.ProjectIds.Count() {
+                let pid: int = r.ProjectIds.Get(i)
+                let secs: int = secsList.Get(i)
+                if (secs <= 0) { continue }
+                det.Date(detRow, 1, y, mo, da, Xlsx.Date())
+                det.Text(detRow, 2, wd, Xlsx.Normal())
+                det.Text(detRow, 3, WebServer.projectCode(projects, pid), Xlsx.Normal())
+                det.Text(detRow, 4, WebServer.projectLabel(projects, pid), Xlsx.Normal())
+                det.Duration(detRow, 5, secs, Xlsx.Hours())
+                det.Formula(detRow, 6, "E" + String_FromInt(detRow) + "*24", Xlsx.Decimal())
+                detRow = detRow + 1
+                WebServer.accumulate(sumIds, sumSecs, sumDays, pid, secs)
+            }
+            if (r.Raw > 0 || r.Target > 0 || r.Personal > 0) {
+                jours.Date(dayRow, 1, y, mo, da, Xlsx.Date())
+                jours.Text(dayRow, 2, wd, Xlsx.Normal())
+                if (r.First > 0) {
+                    jours.Text(dayRow, 3, Day.Hm(r.First), Xlsx.Normal())
+                    jours.Text(dayRow, 4, Day.Hm(r.Last), Xlsx.Normal())
+                } else {
+                    jours.Text(dayRow, 3, "", Xlsx.Normal())
+                    jours.Text(dayRow, 4, "", Xlsx.Normal())
+                }
+                jours.Duration(dayRow, 5, r.Worked, Xlsx.Hours())
+                jours.Duration(dayRow, 6, r.Target, Xlsx.Hours())
+                let rs: string = String_FromInt(dayRow)
+                jours.Formula(dayRow, 7, "(E" + rs + "-F" + rs + ")*24", Xlsx.Decimal())
+                jours.Duration(dayRow, 8, r.Personal, Xlsx.Hours())
+                jours.Duration(dayRow, 9, r.Deduction, Xlsx.Hours())
+                dayRow = dayRow + 1
+            }
+            for p in 0..r.Pieces.Count() {
+                let pc: List<string> = r.Pieces.Get(p)
+                let ps: int = String_ToInt(pc.Get(1))
+                let pe: int = String_ToInt(pc.Get(2))
+                plages.Date(pieceRow, 1, y, mo, da, Xlsx.Date())
+                plages.Text(pieceRow, 2, Day.Hm(ps), Xlsx.Normal())
+                var endTxt: string = Day.Hm(pe)
+                if (String_Length(pc.Get(3)) == 0) { endTxt = endTxt + " (en cours)" }
+                plages.Text(pieceRow, 3, endTxt, Xlsx.Normal())
+                plages.Duration(pieceRow, 4, pe - ps, Xlsx.Hours())
+                plages.Text(pieceRow, 5, WebServer.ActivityName(pc.Get(8)), Xlsx.Normal())
+                let pinned: int = String_ToInt(pc.Get(9))
+                var imput: string = ""
+                if (pinned > 0) { imput = WebServer.projectCode(projects, pinned) }
+                plages.Text(pieceRow, 6, imput, Xlsx.Normal())
+                plages.Text(pieceRow, 7, pc.Get(10), Xlsx.Wrap())
+                pieceRow = pieceRow + 1
+            }
+            d = Day.Add(d, 1)
+            count = count + 1
+        }
+
+        // Synthèse: title block, then one row per imputation + totals.
+        syn.Text(1, 1, "Imputation", Xlsx.Header())
+        syn.Text(1, 2, "Libellé", Xlsx.Header())
+        syn.Text(1, 3, "Jours", Xlsx.Header())
+        syn.Text(1, 4, "Durée", Xlsx.Header())
+        syn.Text(1, 5, "Heures", Xlsx.Header())
+        syn.Text(1, 6, "Part", Xlsx.Header())
+        let n: int = sumIds.Count()
+        let lastData: int = n + 1
+        let totalRow: int = n + 2
+        let tr: string = String_FromInt(totalRow)
+        for k in 0..n {
+            let row: int = k + 2
+            let rs2: string = String_FromInt(row)
+            let pid2: int = sumIds.Get(k)
+            syn.Text(row, 1, WebServer.projectCode(projects, pid2), Xlsx.Normal())
+            syn.Text(row, 2, WebServer.projectLabel(projects, pid2), Xlsx.Normal())
+            syn.Int(row, 3, sumDays.Get(k), Xlsx.Normal())
+            syn.Duration(row, 4, sumSecs.Get(k), Xlsx.Hours())
+            syn.Formula(row, 5, "D" + rs2 + "*24", Xlsx.Decimal())
+            syn.Formula(row, 6, "IF(D$" + tr + "=0,0,D" + rs2 + "/D$" + tr + "*100)", Xlsx.Decimal())
+        }
+        syn.Text(totalRow, 1, "Total", Xlsx.Bold())
+        syn.Text(totalRow, 2, "", Xlsx.Normal())
+        syn.Text(totalRow, 3, "", Xlsx.Normal())
+        if (n > 0) {
+            syn.Formula(totalRow, 4, "SUM(D2:D" + String_FromInt(lastData) + ")", Xlsx.BoldHours())
+            syn.Formula(totalRow, 5, "SUM(E2:E" + String_FromInt(lastData) + ")", Xlsx.BoldDecimal())
+        } else {
+            syn.Duration(totalRow, 4, 0, Xlsx.BoldHours())
+            syn.Number(totalRow, 5, "0", Xlsx.BoldDecimal())
+        }
+        let info: int = totalRow + 2
+        syn.Text(info, 1, "Période", Xlsx.Bold())
+        syn.Text(info, 2, WebServer.FrDate(from) + " au " + WebServer.FrDate(to), Xlsx.Normal())
+        syn.Text(info + 1, 1, "Personne", Xlsx.Bold())
+        syn.Text(info + 1, 2, display, Xlsx.Normal())
+        syn.Text(info + 2, 1, "Part", Xlsx.Bold())
+        syn.Text(info + 2, 2, "en % du total imputé", Xlsx.Normal())
+
+        WebServer.layout(syn, 16, 40, 8, 10, 10, 8)
+        WebServer.layout(det, 12, 10, 16, 40, 10, 10)
+        det.AutoFilter(1, 6, TimeCalc.Max(detRow - 1, 1))
+        WebServer.layout(jours, 12, 10, 9, 9, 11, 11)
+        jours.SetWidth(7, 10)
+        jours.SetWidth(8, 9)
+        jours.SetWidth(9, 13)
+        WebServer.layout(plages, 12, 8, 16, 10, 22, 16)
+        plages.SetWidth(7, 50)
+        plages.AutoFilter(1, 7, TimeCalc.Max(pieceRow - 1, 1))
+
+        return HttpResponse.New().Status(200)
+            .Header("Content-Disposition", "attachment; filename=\"logonoff-" + from + "-" + to + ".xlsx\"")
+            .Header("Cache-Control", "no-store")
+            .Bytes(wb.Bytes(), "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+    }
+
+    static void headers(ws: XlsxSheet, a: string, b: string, c: string, d: string, e: string, f: string) {
+        ws.Text(1, 1, a, Xlsx.Header())
+        ws.Text(1, 2, b, Xlsx.Header())
+        ws.Text(1, 3, c, Xlsx.Header())
+        ws.Text(1, 4, d, Xlsx.Header())
+        ws.Text(1, 5, e, Xlsx.Header())
+        ws.Text(1, 6, f, Xlsx.Header())
+    }
+
+    static void layout(ws: XlsxSheet, a: int, b: int, c: int, d: int, e: int, f: int) {
+        ws.SetWidth(1, a)
+        ws.SetWidth(2, b)
+        ws.SetWidth(3, c)
+        ws.SetWidth(4, d)
+        ws.SetWidth(5, e)
+        ws.SetWidth(6, f)
+        ws.FreezeTopRow()
+    }
+
+    static void accumulate(ids: List<int>, secs: List<int>, days: List<int>, pid: int, s: int) {
+        for i in 0..ids.Count() {
+            if (ids.Get(i) == pid) {
+                WebServer.setAt(secs, i, secs.Get(i) + s)
+                WebServer.setAt(days, i, days.Get(i) + 1)
+                return
+            }
+        }
+        ids.Add(pid)
+        secs.Add(s)
+        days.Add(1)
+    }
+
+    static string projectCode(projects: List<List<string>>, pid: int) {
+        for k in 0..projects.Count() {
+            let pr: List<string> = projects.Get(k)
+            if (String_ToInt(pr.Get(0)) == pid) { return pr.Get(1) }
+        }
+        return ""
+    }
+
+    static string projectLabel(projects: List<List<string>>, pid: int) {
+        if (pid == 0) { return "Sans projet" }
+        for k in 0..projects.Count() {
+            let pr: List<string> = projects.Get(k)
+            if (String_ToInt(pr.Get(0)) == pid) { return pr.Get(2) }
+        }
+        return ""
+    }
+
+    public static string ActivityName(a: string) {
+        if (a == "reunion") { return "Réunion" }
+        if (a == "deplacement") { return "Déplacement" }
+        if (a == "urgence") { return "Urgence / astreinte" }
+        if (a == "autre") { return "Autre travail" }
+        if (a == "perso") { return "Personnel (non compté)" }
+        return "Au poste"
+    }
+
+    // "2026-10-27" → "27/10/2026"
+    public static string FrDate(date: string) {
+        let p: List<string> = String_Split(date, "-")
+        return p.Get(2) + "/" + p.Get(1) + "/" + p.Get(0)
+    }
+
     // Seconds → "7,25" (hours, 2 decimals, decimal comma).
     public static string Hours(secs: int) {
         let cents: int = (secs * 100 + 1800) / 3600
@@ -686,7 +915,9 @@ public class WebServer {
         if (!WebServer.IsIntervalActivity(activity)) { return WebServer.Err(400, "activité inconnue") }
         let pid: int = WebServer.JInt(body, "projectId")
         if (!this.projectOk(c, pid, false)) { return WebServer.Err(404, "projet introuvable") }
-        this.Store.AddManualInterval(c.UserId, s, e, activity, pid)
+        let note: string = String_Trim(WebServer.JStr(body, "note"))
+        if (String_Length(note) > 500) { return WebServer.Err(400, "note trop longue (500 caractères max)") }
+        this.Store.AddManualInterval(c.UserId, s, e, activity, pid, note)
         return WebServer.Ok()
     }
 
@@ -745,7 +976,7 @@ public class WebServer {
             if (WebServer.IsBreakKind(k)) {
                 this.Store.AddBreak(c.UserId, starts.Get(j), ends.Get(j), k)
             } else {
-                this.Store.AddManualInterval(c.UserId, starts.Get(j), ends.Get(j), k, pids.Get(j))
+                this.Store.AddManualInterval(c.UserId, starts.Get(j), ends.Get(j), k, pids.Get(j), "")
             }
         }
         return WebServer.Ok()

@@ -1,0 +1,67 @@
+// Builds a two-sheet workbook exercising every cell kind and style, and
+// saves it to the path given as first argument. run_tests.sh then checks
+// the file with Python (zip + XML) and LibreOffice (formula results).
+
+namespace Tests
+
+import Amalgame.Formats.Xlsx
+
+public class Program {
+    public static void Main(string[] args) {
+        let path: string = Args_Get(1)
+
+        // Pure helpers.
+        if (Xlsx.ColumnName(1) == "A" && Xlsx.ColumnName(26) == "Z" && Xlsx.ColumnName(27) == "AA" && Xlsx.ColumnName(703) == "AAA") {
+            Console.WriteLine("[PASS] column names")
+        } else {
+            Console.WriteLine("[FAIL] column names")
+        }
+        if (Xlsx.DateSerial(1970, 1, 1) == 25569 && Xlsx.DateSerial(2026, 10, 27) == 46322) {
+            Console.WriteLine("[PASS] date serial")
+        } else {
+            Console.WriteLine("[FAIL] date serial")
+        }
+        if (Xlsx.DayFraction(27000) == "0.3125000000000000" && Xlsx.DayFraction(50400) == "0.5833333333333333"
+            && Xlsx.DayFraction(90000) == "1.0416666666666667" && Xlsx.DayFraction(86399) == "0.9999884259259259") {
+            Console.WriteLine("[PASS] day fraction")
+        } else {
+            Console.WriteLine("[FAIL] day fraction")
+        }
+        if (Xlsx.Escape("a<b & \"c\">") == "a&lt;b &amp; &quot;c&quot;&gt;" && Xlsx.SheetName("a/b:c[d]") == "a-b-c-d-") {
+            Console.WriteLine("[PASS] escaping")
+        } else {
+            Console.WriteLine("[FAIL] escaping")
+        }
+
+        let wb = new XlsxWorkbook()
+        wb.Creator = "xlsx_test"
+        let ws: XlsxSheet = wb.AddSheet("Heures")
+        ws.Text(1, 1, "Date", Xlsx.Header())
+        ws.Text(1, 2, "Projet", Xlsx.Header())
+        ws.Text(1, 3, "Durée", Xlsx.Header())
+        ws.Text(1, 4, "Heures", Xlsx.Header())
+        ws.Date(2, 1, 2026, 10, 26, Xlsx.Date())
+        ws.Text(2, 2, "IMP-114 « Réunion » & co", Xlsx.Normal())
+        ws.Duration(2, 3, 50400, Xlsx.Hours())          // 14:00
+        ws.Number(2, 4, "14", Xlsx.Decimal())
+        ws.Date(3, 1, 2026, 10, 27, Xlsx.Date())
+        ws.Text(3, 2, "IMP-087", Xlsx.Normal())
+        ws.Duration(3, 3, 45000, Xlsx.Hours())          // 12:30
+        ws.Number(3, 4, "12.5", Xlsx.Decimal())
+        ws.Text(4, 2, "Total", Xlsx.Bold())
+        ws.Formula(4, 3, "SUM(C2:C3)", Xlsx.BoldHours()) // 26:30 → past 24 h
+        ws.Formula(4, 4, "SUM(D2:D3)", Xlsx.BoldDecimal())
+        ws.SetWidth(2, 32)
+        ws.SetWidth(3, 10)
+        ws.FreezeTopRow()
+        ws.AutoFilter(1, 4, 3)
+        let ws2: XlsxSheet = wb.AddSheet("Notes")
+        ws2.Text(1, 1, "ligne 1", Xlsx.Wrap())
+        ws2.Int(2, 1, 42, Xlsx.Normal())
+        if (wb.Save(path)) {
+            Console.WriteLine("[PASS] saved")
+        } else {
+            Console.WriteLine("[FAIL] saved")
+        }
+    }
+}

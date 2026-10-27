@@ -1,0 +1,22 @@
+# Package manifest — amalgame-formats-xlsx
+#
+# Pure-Amalgame Excel (.xlsx) writer: several sheets, typed cells (text,
+# number, date, duration, formula), fixed style set, column widths,
+# frozen header, auto-filter. STORED ZIP container — no zlib.
+#
+#   amc package add github.com/amalgame-lang/amalgame-formats-xlsx@v0.1.0
+
+[package]
+name              = "amalgame-formats-xlsx"
+version           = "0.1.0"
+license           = "Apache-2.0"
+description       = "Pure-Amalgame Excel .xlsx writer: multiple sheets, text/number/date/duration/formula cells, styles ([h]:mm, 0.00, dd/mm/yyyy, bold, header), column widths, frozen header row, auto-filter. No external library."
+authors           = ["Bastien Mouget"]
+required-amalgame = ">=0.8.40"
+schema-version    = 1
+
+[stdlib]
+class     = "Xlsx"
+header    = "facade-stub.h"
+namespace = "Amalgame.Formats.Xlsx"
+facade    = "facade.am"

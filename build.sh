@@ -41,7 +41,7 @@ export AMALGAME_PACKAGES_DIR="$PWD/packages"
 # Order matters: dependencies before dependants (tls needs crypto,
 # net-http needs tls + async).
 PKGS=(crypto@v0.8.0 async@v0.4.1 tls@v0.3.6 net-http@v0.30.0 threading@v0.1.0
-      database-sqlite@v0.4.0 datetime@v0.3.0 service@v0.3.0)
+      database-sqlite@v0.4.0 datetime@v0.3.0 service@v0.3.0 formats-xlsx@v0.1.0)
 
 mkdir -p build
 log "Packages ($PLAT, offline from ./packages)"

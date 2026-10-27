@@ -94,6 +94,22 @@ l'ancienne version C# (service + notifier WinForms + CSV hebdomadaires).
   modes : objectif du jour, ou cumul de la semaine à date (comme l'ancien
   notifier).
 
+## Export Excel
+
+**Rapport → Exporter Excel** produit un vrai classeur `.xlsx` à quatre
+feuilles :
+
+- **Synthèse** : une ligne par imputation (jours, durée, heures décimales,
+  part), totaux en formules ;
+- **Détail** : jour × imputation, avec filtres ;
+- **Journées** : arrivée, départ, travaillé, objectif, écart, perso,
+  pause déduite ;
+- **Plages** : chaque plage avec activité, imputation et note.
+
+Les durées sont de vraies heures Excel (`[h]:mm`), qui s'additionnent
+au-delà de 24 h. Le classeur est produit par le paquet
+`amalgame-formats-xlsx`.
+
 ## Export (Espace Temps)
 
 **Rapport → Export Espace Temps** produit une ligne par jour et par projet,
@@ -154,6 +170,23 @@ pacman -S --needed mingw-w64-x86_64-gcc mingw-w64-x86_64-gc mingw-w64-x86_64-ope
 lie, puis prépare `dist/` : `logonoff.exe`, `www/`, les scripts
 d'installation et les DLL MinGW nécessaires. Un service ne voit pas le
 `PATH` de MSYS2, d'où la copie des DLL à côté de l'exécutable.
+
+## Versions publiées (CI)
+
+GitHub Actions (`.github/workflows/build.yml`) compile Logonoff sous
+Windows à chaque push et produit le MSI, ainsi qu'un zip portable. Ces
+fichiers sont disponibles dans l'onglet *Actions*, comme artefacts de
+chaque exécution.
+
+Pour publier une version :
+
+```bash
+git tag v0.2.0 && git push origin v0.2.0
+```
+
+Une **Release GitHub** est alors créée, avec `Logonoff-0.2.0.msi` et le
+zip attachés. Le MSI porte la version du tag : il met à jour une
+installation plus ancienne.
 
 ## Installer
 

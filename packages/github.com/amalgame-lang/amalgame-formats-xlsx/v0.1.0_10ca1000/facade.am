@@ -1,0 +1,573 @@
+namespace Amalgame.Formats.Xlsx
+
+import Amalgame.Collections
+
+// ── Xlsx ──────────────────────────────────────────────
+//
+// Writes real Excel workbooks (.xlsx, Office Open XML) — no template, no
+// external library. Several sheets, typed cells (text, number, date,
+// duration, formula), a small fixed set of styles, column widths, frozen
+// header row and auto-filter.
+//
+//     import Amalgame.Formats.Xlsx
+//
+//     let wb = new XlsxWorkbook()
+//     let ws: XlsxSheet = wb.AddSheet("Heures")
+//     ws.Text(1, 1, "Projet", Xlsx.Header())
+//     ws.Text(1, 2, "Durée", Xlsx.Header())
+//     ws.Text(2, 1, "IMP-114", Xlsx.Normal())
+//     ws.Duration(2, 2, 27000, Xlsx.Hours())          // 7:30
+//     ws.Formula(3, 2, "SUM(B2:B2)", Xlsx.BoldHours())
+//     ws.SetWidth(1, 30)
+//     ws.FreezeTopRow()
+//     let bytes: List<int> = wb.Bytes()                // → HttpResponse.Bytes(…)
+//
+// Rows and columns are 1-based (Excel convention). Cells must be added
+// row by row, left to right (each row is written once, in order).
+//
+// The ZIP container uses the STORED method (no compression): Excel,
+// LibreOffice and Numbers all accept it, and it keeps this package free of
+// zlib. The writer is the one proven in production by the NidClair and
+// BGF exports (Sites).
+//
+// Durations are stored as fractions of a day — Excel's native time
+// representation — so `[h]:mm` cells add up past 24 h and SUM() works.
+// Dates are Excel serial numbers (days since 1899-12-30).
+
+@c {
+    #include <stdio.h>
+    #include <string.h>
+    #include <stdint.h>
+
+    static void Amalgame_Xlsx_Put(AmalgameList* out, const unsigned char* p, size_t n) {
+        for (size_t i = 0; i < n; i++) AmalgameList_add(out, (void*) (intptr_t) p[i]);
+    }
+
+    static void Amalgame_Xlsx_U16(unsigned char* b, uint32_t v) {
+        b[0] = (unsigned char) (v & 0xFF);
+        b[1] = (unsigned char) ((v >> 8) & 0xFF);
+    }
+
+    static void Amalgame_Xlsx_U32(unsigned char* b, uint32_t v) {
+        b[0] = (unsigned char) (v & 0xFF);
+        b[1] = (unsigned char) ((v >> 8) & 0xFF);
+        b[2] = (unsigned char) ((v >> 16) & 0xFF);
+        b[3] = (unsigned char) ((v >> 24) & 0xFF);
+    }
+
+    static uint32_t Amalgame_Xlsx_Crc32(const unsigned char* p, size_t n) {
+        uint32_t crc = 0xFFFFFFFFu;
+        for (size_t k = 0; k < n; k++) {
+            crc ^= p[k];
+            for (int bit = 0; bit < 8; bit++) {
+                uint32_t mask = (uint32_t) (-(int32_t) (crc & 1u));
+                crc = (crc >> 1) ^ (0xEDB88320u & mask);
+            }
+        }
+        return ~crc;
+    }
+
+    /* ZIP archive (STORED) of `names[i]` → `contents[i]` (UTF-8 text,
+     * NUL-free — every part of an .xlsx is XML). Appended to `out` as
+     * one byte per list item. */
+    static void Amalgame_Xlsx_Zip(AmalgameList* names, AmalgameList* contents, AmalgameList* out) {
+        int n = AmalgameList_count(names);
+        uint32_t* crcs = (uint32_t*) GC_MALLOC_ATOMIC(sizeof(uint32_t) * (n > 0 ? n : 1));
+        uint32_t* sizes = (uint32_t*) GC_MALLOC_ATOMIC(sizeof(uint32_t) * (n > 0 ? n : 1));
+        uint32_t* offsets = (uint32_t*) GC_MALLOC_ATOMIC(sizeof(uint32_t) * (n > 0 ? n : 1));
+        uint32_t pos = 0;
+        for (int i = 0; i < n; i++) {
+            const char* name = (const char*) AmalgameList_get(names, i);
+            const char* data = (const char*) AmalgameList_get(contents, i);
+            if (!data) data = "";
+            size_t nlen = strlen(name), dlen = strlen(data);
+            uint32_t crc = Amalgame_Xlsx_Crc32((const unsigned char*) data, dlen);
+            crcs[i] = crc;
+            sizes[i] = (uint32_t) dlen;
+            offsets[i] = pos;
+            unsigned char lh[30];
+            memset(lh, 0, sizeof(lh));
+            Amalgame_Xlsx_U32(lh, 0x04034b50u);
+            Amalgame_Xlsx_U16(lh + 4, 20);          /* version needed */
+            Amalgame_Xlsx_U16(lh + 6, 0x0800);      /* flags: UTF-8 names */
+            Amalgame_Xlsx_U16(lh + 12, 0x0021);     /* DOS date 1980-01-01 */
+            Amalgame_Xlsx_U32(lh + 14, crc);
+            Amalgame_Xlsx_U32(lh + 18, (uint32_t) dlen);
+            Amalgame_Xlsx_U32(lh + 22, (uint32_t) dlen);
+            Amalgame_Xlsx_U16(lh + 26, (uint32_t) nlen);
+            Amalgame_Xlsx_Put(out, lh, 30);
+            Amalgame_Xlsx_Put(out, (const unsigned char*) name, nlen);
+            Amalgame_Xlsx_Put(out, (const unsigned char*) data, dlen);
+            pos += 30 + (uint32_t) nlen + (uint32_t) dlen;
+        }
+        uint32_t cdStart = pos;
+        for (int i = 0; i < n; i++) {
+            const char* name = (const char*) AmalgameList_get(names, i);
+            size_t nlen = strlen(name);
+            unsigned char ch[46];
+            memset(ch, 0, sizeof(ch));
+            Amalgame_Xlsx_U32(ch, 0x02014b50u);
+            Amalgame_Xlsx_U16(ch + 4, 20);
+            Amalgame_Xlsx_U16(ch + 6, 20);
+            Amalgame_Xlsx_U16(ch + 8, 0x0800);
+            Amalgame_Xlsx_U16(ch + 14, 0x0021);
+            Amalgame_Xlsx_U32(ch + 16, crcs[i]);
+            Amalgame_Xlsx_U32(ch + 20, sizes[i]);
+            Amalgame_Xlsx_U32(ch + 24, sizes[i]);
+            Amalgame_Xlsx_U16(ch + 28, (uint32_t) nlen);
+            Amalgame_Xlsx_U32(ch + 42, offsets[i]);
+            Amalgame_Xlsx_Put(out, ch, 46);
+            Amalgame_Xlsx_Put(out, (const unsigned char*) name, nlen);
+            pos += 46 + (uint32_t) nlen;
+        }
+        unsigned char eocd[22];
+        memset(eocd, 0, sizeof(eocd));
+        Amalgame_Xlsx_U32(eocd, 0x06054b50u);
+        Amalgame_Xlsx_U16(eocd + 8, (uint32_t) n);
+        Amalgame_Xlsx_U16(eocd + 10, (uint32_t) n);
+        Amalgame_Xlsx_U32(eocd + 12, pos - cdStart);
+        Amalgame_Xlsx_U32(eocd + 16, cdStart);
+        Amalgame_Xlsx_Put(out, eocd, 22);
+    }
+
+    /* XML text escaping; drops the control characters XML 1.0 forbids. */
+    static char* Amalgame_Xlsx_Esc(const char* s) {
+        if (!s) s = "";
+        size_t n = strlen(s), cap = n * 6 + 1, o = 0;
+        char* out = (char*) GC_MALLOC_ATOMIC(cap);
+        for (size_t i = 0; i < n; i++) {
+            unsigned char c = (unsigned char) s[i];
+            const char* rep = NULL;
+            if (c == '&') rep = "&amp;";
+            else if (c == '<') rep = "&lt;";
+            else if (c == '>') rep = "&gt;";
+            else if (c == '"') rep = "&quot;";
+            else if (c < 0x20 && c != '\t' && c != '\n' && c != '\r') continue;
+            if (rep) { size_t rl = strlen(rep); memcpy(out + o, rep, rl); o += rl; }
+            else out[o++] = (char) c;
+        }
+        out[o] = 0;
+        return out;
+    }
+}
+
+// Style ids accepted by the cell writers (indexes into cellXfs).
+public class Xlsx {
+    public Xlsx() {}
+
+    public static int Normal()      { return 0 }
+    public static int Bold()        { return 1 }
+    public static int Hours()       { return 2 }   // [h]:mm — durations, adds past 24 h
+    public static int Decimal()     { return 3 }   // 0.00 (shown with the locale's separator)
+    public static int Date()        { return 4 }   // dd/mm/yyyy
+    public static int BoldHours()   { return 5 }
+    public static int BoldDecimal() { return 6 }
+    public static int Header()      { return 7 }   // bold on a light fill, bottom border
+    public static int Wrap()        { return 8 }   // text wrapped in the cell
+
+    // Column letters: 1 → A, 26 → Z, 27 → AA …
+    public static string ColumnName(col: int) {
+        var n: int = col
+        var out: string = ""
+        while (n > 0) {
+            let r: int = (n - 1) % 26
+            out = String_Substring("ABCDEFGHIJKLMNOPQRSTUVWXYZ", r, 1) + out
+            n = (n - 1) / 26
+        }
+        return out
+    }
+
+    // "B7"
+    public static string Ref(row: int, col: int) {
+        return Xlsx.ColumnName(col) + String_FromInt(row)
+    }
+
+    public static string Escape(s: string) {
+        @c { return Amalgame_Xlsx_Esc(s); }
+    }
+
+    // Excel serial number of a calendar date (1900 date system).
+    public static int DateSerial(year: int, month: int, day: int) {
+        var y: int = year
+        let m: int = month
+        if (m <= 2) { y = y - 1 }
+        var era: int = 0
+        if (y >= 0) { era = y / 400 } else { era = (y - 399) / 400 }
+        let yoe: int = y - era * 400
+        var mp: int = m - 3
+        if (m <= 2) { mp = m + 9 }
+        let doy: int = (153 * mp + 2) / 5 + day - 1
+        let doe: int = yoe * 365 + yoe / 4 - yoe / 100 + doy
+        let epochDays: int = era * 146097 + doe - 719468
+        return epochDays + 25569
+    }
+
+    // Seconds → fraction of a day as a decimal string with 16 decimals,
+    // correctly rounded ("0.5833333333333333" for 14:00): parsed back as
+    // a double it is the very value Excel stores for that time, so a
+    // [h]:mm cell shows 14:00, not 13:59:59. Integer long division only.
+    public static string DayFraction(seconds: int) {
+        var s: int = seconds
+        var sign: string = ""
+        if (s < 0) {
+            sign = "-"
+            s = 0 - s
+        }
+        var whole: int = s / 86400
+        var rem: int = s % 86400
+        let digits = new List<int>()
+        for i in 0..17 {
+            rem = rem * 10
+            digits.Add(rem / 86400)
+            rem = rem % 86400
+        }
+        // Round on the 17th digit, carrying leftwards.
+        var carry: int = 0
+        if (digits.Get(16) >= 5) { carry = 1 }
+        var out: string = ""
+        var k: int = 15
+        while (k >= 0) {
+            var d: int = digits.Get(k) + carry
+            carry = 0
+            if (d == 10) {
+                d = 0
+                carry = 1
+            }
+            out = String_FromInt(d) + out
+            k = k - 1
+        }
+        whole = whole + carry
+        return sign + String_FromInt(whole) + "." + out
+    }
+
+    // Excel sheet names: ≤ 31 chars, none of : \ / ? * [ ].
+    public static string SheetName(name: string) {
+        var out: string = ""
+        let n: int = String_Length(name)
+        for i in 0..n {
+            let c: string = String_Substring(name, i, 1)
+            if (c == ":" || c == "\\" || c == "/" || c == "?" || c == "*" || c == "[" || c == "]") {
+                out = out + "-"
+            } else {
+                out = out + c
+            }
+        }
+        if (String_Length(out) == 0) { out = "Feuille" }
+        if (String_Length(out) > 31) { out = String_Substring(out, 0, 31) }
+        return out
+    }
+}
+
+public class XlsxSheet {
+    public Name:       string
+    public Rows:       List<string>    // finished <row> elements
+    public CurRow:     int
+    public CurCells:   string
+    public Widths:     List<int>       // column → width (0 = default)
+    public Freeze:     bool
+    public FilterFrom: string          // auto-filter range, "" = none
+    public FilterTo:   string
+
+    public XlsxSheet(name: string) {
+        this.Name = Xlsx.SheetName(name)
+        this.Rows = new List<string>()
+        this.CurRow = 0
+        this.CurCells = ""
+        this.Widths = new List<int>()
+        this.Freeze = false
+        this.FilterFrom = ""
+        this.FilterTo = ""
+    }
+
+    private void cell(row: int, col: int, inner: string) {
+        if (row != this.CurRow) {
+            this.flush()
+            this.CurRow = row
+        }
+        this.CurCells = this.CurCells + inner
+    }
+
+    private void flush() {
+        if (this.CurRow > 0) {
+            this.Rows.Add("<row r=\"" + String_FromInt(this.CurRow) + "\">" + this.CurCells + "</row>")
+        }
+        this.CurCells = ""
+    }
+
+    private static string styleAttr(style: int) {
+        if (style <= 0) { return "" }
+        return " s=\"" + String_FromInt(style) + "\""
+    }
+
+    public void Text(row: int, col: int, value: string, style: int) {
+        let r: string = Xlsx.Ref(row, col)
+        if (String_Length(value) == 0) {
+            this.cell(row, col, "<c r=\"" + r + "\"" + XlsxSheet.styleAttr(style) + "/>")
+            return
+        }
+        this.cell(row, col, "<c r=\"" + r + "\"" + XlsxSheet.styleAttr(style) + " t=\"inlineStr\"><is><t xml:space=\"preserve\">"
+            + Xlsx.Escape(value) + "</t></is></c>")
+    }
+
+    // `value` is a number in invariant notation: "42", "-3.5", "0.3125".
+    public void Number(row: int, col: int, value: string, style: int) {
+        this.cell(row, col, "<c r=\"" + Xlsx.Ref(row, col) + "\"" + XlsxSheet.styleAttr(style) + "><v>" + value + "</v></c>")
+    }
+
+    public void Int(row: int, col: int, value: int, style: int) {
+        this.Number(row, col, String_FromInt(value), style)
+    }
+
+    // A duration in seconds, stored as a day fraction. Use Xlsx.Hours().
+    public void Duration(row: int, col: int, seconds: int, style: int) {
+        this.Number(row, col, Xlsx.DayFraction(seconds), style)
+    }
+
+    // A calendar date. Use Xlsx.Date().
+    public void Date(row: int, col: int, year: int, month: int, day: int, style: int) {
+        this.Int(row, col, Xlsx.DateSerial(year, month, day), style)
+    }
+
+    // Formula without the leading "=", e.g. "SUM(B2:B9)". Excel and
+    // LibreOffice compute it on open.
+    public void Formula(row: int, col: int, formula: string, style: int) {
+        this.cell(row, col, "<c r=\"" + Xlsx.Ref(row, col) + "\"" + XlsxSheet.styleAttr(style) + "><f>" + Xlsx.Escape(formula) + "</f></c>")
+    }
+
+    // Column width in characters (Excel "width" units).
+    public void SetWidth(col: int, width: int) {
+        if (col < 1) { return }
+        while (this.Widths.Count() < col) { this.Widths.Add(0) }
+        let w: List<int> = this.Widths
+        @c { if (w && col >= 1 && col <= w->size) w->data[col - 1] = (void*) (intptr_t) width; }
+    }
+
+    // Keep row 1 visible while scrolling.
+    public void FreezeTopRow() {
+        this.Freeze = true
+    }
+
+    // Filter buttons on the header row, over [fromCol..toCol] × [1..lastRow].
+    public void AutoFilter(fromCol: int, toCol: int, lastRow: int) {
+        this.FilterFrom = Xlsx.Ref(1, fromCol)
+        this.FilterTo = Xlsx.Ref(TimeMax.Of(lastRow, 1), toCol)
+    }
+
+    public string Xml() {
+        this.flush()
+        var x: string = "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>"
+            + "<worksheet xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\" "
+            + "xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\">"
+        if (this.Freeze) {
+            x = x + "<sheetViews><sheetView workbookViewId=\"0\"><pane ySplit=\"1\" topLeftCell=\"A2\" activePane=\"bottomLeft\" state=\"frozen\"/>"
+                + "<selection pane=\"bottomLeft\" activeCell=\"A2\" sqref=\"A2\"/></sheetView></sheetViews>"
+        }
+        var cols: string = ""
+        for i in 0..this.Widths.Count() {
+            let w: int = this.Widths.Get(i)
+            if (w > 0) {
+                let c: string = String_FromInt(i + 1)
+                cols = cols + "<col min=\"" + c + "\" max=\"" + c + "\" width=\"" + String_FromInt(w) + "\" customWidth=\"1\"/>"
+            }
+        }
+        if (String_Length(cols) > 0) { x = x + "<cols>" + cols + "</cols>" }
+        x = x + "<sheetData>" + String_Join(this.Rows, "") + "</sheetData>"
+        if (String_Length(this.FilterFrom) > 0) {
+            x = x + "<autoFilter ref=\"" + this.FilterFrom + ":" + this.FilterTo + "\"/>"
+        }
+        return x + "</worksheet>"
+    }
+}
+
+// max() helper kept out of XlsxSheet: amc mis-forward-declares a
+// same-class static used before its definition in some versions.
+public class TimeMax {
+    public TimeMax() {}
+
+    public static int Of(a: int, b: int) {
+        if (a > b) { return a }
+        return b
+    }
+}
+
+public class XlsxWorkbook {
+    public Sheets:  List<XlsxSheet>
+    public Creator: string
+
+    public XlsxWorkbook() {
+        this.Sheets = new List<XlsxSheet>()
+        this.Creator = "Amalgame"
+    }
+
+    public XlsxSheet AddSheet(name: string) {
+        let s = new XlsxSheet(name)
+        this.Sheets.Add(s)
+        return s
+    }
+
+    static string contentTypes(n: int) {
+        var x: string = "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>"
+            + "<Types xmlns=\"http://schemas.openxmlformats.org/package/2006/content-types\">"
+            + "<Default Extension=\"rels\" ContentType=\"application/vnd.openxmlformats-package.relationships+xml\"/>"
+            + "<Default Extension=\"xml\" ContentType=\"application/xml\"/>"
+            + "<Override PartName=\"/xl/workbook.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml\"/>"
+            + "<Override PartName=\"/xl/styles.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml\"/>"
+            + "<Override PartName=\"/docProps/core.xml\" ContentType=\"application/vnd.openxmlformats-package.core-properties+xml\"/>"
+            + "<Override PartName=\"/docProps/app.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.extended-properties+xml\"/>"
+        for i in 1..(n + 1) {
+            x = x + "<Override PartName=\"/xl/worksheets/sheet" + String_FromInt(i)
+                + ".xml\" ContentType=\"application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml\"/>"
+        }
+        return x + "</Types>"
+    }
+
+    static string rootRels() {
+        return "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>"
+            + "<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">"
+            + "<Relationship Id=\"rId1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument\" Target=\"xl/workbook.xml\"/>"
+            + "<Relationship Id=\"rId2\" Type=\"http://schemas.openxmlformats.org/package/2006/relationships/metadata/core-properties\" Target=\"docProps/core.xml\"/>"
+            + "<Relationship Id=\"rId3\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/extended-properties\" Target=\"docProps/app.xml\"/>"
+            + "</Relationships>"
+    }
+
+    string core() {
+        return "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>"
+            + "<cp:coreProperties xmlns:cp=\"http://schemas.openxmlformats.org/package/2006/metadata/core-properties\" "
+            + "xmlns:dc=\"http://purl.org/dc/elements/1.1/\"><dc:creator>" + Xlsx.Escape(this.Creator) + "</dc:creator></cp:coreProperties>"
+    }
+
+    string app() {
+        return "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>"
+            + "<Properties xmlns=\"http://schemas.openxmlformats.org/officeDocument/2006/extended-properties\">"
+            + "<Application>" + Xlsx.Escape(this.Creator) + "</Application></Properties>"
+    }
+
+    string workbook() {
+        var sheets: string = ""
+        for i in 0..this.Sheets.Count() {
+            let s: XlsxSheet = this.Sheets.Get(i)
+            let id: string = String_FromInt(i + 1)
+            sheets = sheets + "<sheet name=\"" + Xlsx.Escape(s.Name) + "\" sheetId=\"" + id + "\" r:id=\"rId" + id + "\"/>"
+        }
+        var defined: string = ""
+        for j in 0..this.Sheets.Count() {
+            let s2: XlsxSheet = this.Sheets.Get(j)
+            if (String_Length(s2.FilterFrom) > 0) {
+                let from: string = s2.FilterFrom
+                let to: string = s2.FilterTo
+                defined = defined + "<definedName name=\"_xlnm._FilterDatabase\" localSheetId=\"" + String_FromInt(j)
+                    + "\" hidden=\"1\">'" + Xlsx.Escape(s2.Name) + "'!$" + XlsxWorkbook.absRef(from) + ":$" + XlsxWorkbook.absRef(to) + "</definedName>"
+            }
+        }
+        var x: string = "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>"
+            + "<workbook xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\" "
+            + "xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\">"
+            + "<sheets>" + sheets + "</sheets>"
+        if (String_Length(defined) > 0) { x = x + "<definedNames>" + defined + "</definedNames>" }
+        return x + "</workbook>"
+    }
+
+    // "B12" → "B$12" (the leading "$" is added by the caller).
+    static string absRef(ref: string) {
+        var at: int = -1
+        @c {
+            for (int i = 0; ref && ref[i]; i++) {
+                if (ref[i] >= '0' && ref[i] <= '9') { at = i; break; }
+            }
+        }
+        if (at < 0) { return ref }
+        return String_Substring(ref, 0, at) + "$" + String_Substring(ref, at, -1)
+    }
+
+    string workbookRels() {
+        let n: int = this.Sheets.Count()
+        var x: string = "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>"
+            + "<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">"
+        for i in 1..(n + 1) {
+            let id: string = String_FromInt(i)
+            x = x + "<Relationship Id=\"rId" + id + "\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet\" Target=\"worksheets/sheet" + id + ".xml\"/>"
+        }
+        return x + "<Relationship Id=\"rId" + String_FromInt(n + 1) + "\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles\" Target=\"styles.xml\"/>"
+            + "</Relationships>"
+    }
+
+    // cellXfs order = the Xlsx.* style ids.
+    static string styles() {
+        return "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>"
+            + "<styleSheet xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\">"
+            + "<numFmts count=\"3\">"
+            + "<numFmt numFmtId=\"164\" formatCode=\"[h]:mm\"/>"
+            + "<numFmt numFmtId=\"165\" formatCode=\"0.00\"/>"
+            + "<numFmt numFmtId=\"166\" formatCode=\"dd/mm/yyyy\"/>"
+            + "</numFmts>"
+            + "<fonts count=\"2\"><font><sz val=\"11\"/><name val=\"Calibri\"/></font>"
+            + "<font><b/><sz val=\"11\"/><name val=\"Calibri\"/></font></fonts>"
+            + "<fills count=\"3\"><fill><patternFill patternType=\"none\"/></fill>"
+            + "<fill><patternFill patternType=\"gray125\"/></fill>"
+            + "<fill><patternFill patternType=\"solid\"><fgColor rgb=\"FFCCFBF1\"/><bgColor indexed=\"64\"/></patternFill></fill></fills>"
+            + "<borders count=\"2\"><border><left/><right/><top/><bottom/><diagonal/></border>"
+            + "<border><left/><right/><top/><bottom style=\"thin\"><color rgb=\"FF0F766E\"/></bottom><diagonal/></border></borders>"
+            + "<cellStyleXfs count=\"1\"><xf numFmtId=\"0\" fontId=\"0\" fillId=\"0\" borderId=\"0\"/></cellStyleXfs>"
+            + "<cellXfs count=\"9\">"
+            + "<xf numFmtId=\"0\" fontId=\"0\" fillId=\"0\" borderId=\"0\" xfId=\"0\"/>"
+            + "<xf numFmtId=\"0\" fontId=\"1\" fillId=\"0\" borderId=\"0\" xfId=\"0\" applyFont=\"1\"/>"
+            + "<xf numFmtId=\"164\" fontId=\"0\" fillId=\"0\" borderId=\"0\" xfId=\"0\" applyNumberFormat=\"1\"/>"
+            + "<xf numFmtId=\"165\" fontId=\"0\" fillId=\"0\" borderId=\"0\" xfId=\"0\" applyNumberFormat=\"1\"/>"
+            + "<xf numFmtId=\"166\" fontId=\"0\" fillId=\"0\" borderId=\"0\" xfId=\"0\" applyNumberFormat=\"1\"/>"
+            + "<xf numFmtId=\"164\" fontId=\"1\" fillId=\"0\" borderId=\"0\" xfId=\"0\" applyNumberFormat=\"1\" applyFont=\"1\"/>"
+            + "<xf numFmtId=\"165\" fontId=\"1\" fillId=\"0\" borderId=\"0\" xfId=\"0\" applyNumberFormat=\"1\" applyFont=\"1\"/>"
+            + "<xf numFmtId=\"0\" fontId=\"1\" fillId=\"2\" borderId=\"1\" xfId=\"0\" applyFont=\"1\" applyFill=\"1\" applyBorder=\"1\"/>"
+            + "<xf numFmtId=\"0\" fontId=\"0\" fillId=\"0\" borderId=\"0\" xfId=\"0\" applyAlignment=\"1\"><alignment wrapText=\"1\" vertical=\"top\"/></xf>"
+            + "</cellXfs>"
+            + "<cellStyles count=\"1\"><cellStyle name=\"Normal\" xfId=\"0\" builtinId=\"0\"/></cellStyles>"
+            + "</styleSheet>"
+    }
+
+    // Write the .xlsx to `path`. False on I/O error.
+    public bool Save(path: string) {
+        let bytes: List<int> = this.Bytes()
+        @c {
+            FILE* f = fopen(path, "wb");
+            if (!f) return 0;
+            int n = bytes->size;
+            unsigned char buf[4096];
+            int k = 0;
+            for (int i = 0; i < n; i++) {
+                buf[k++] = (unsigned char) (intptr_t) bytes->data[i];
+                if (k == (int) sizeof(buf)) { fwrite(buf, 1, k, f); k = 0; }
+            }
+            if (k) fwrite(buf, 1, k, f);
+            return fclose(f) == 0 ? 1 : 0;
+        }
+    }
+
+    // The .xlsx file, one byte per item — ready for HttpResponse.Bytes
+    // or a file write.
+    public List<int> Bytes() {
+        if (this.Sheets.Count() == 0) { this.AddSheet("Feuille1") }
+        let names = new List<string>()
+        let parts = new List<string>()
+        names.Add("[Content_Types].xml")
+        parts.Add(XlsxWorkbook.contentTypes(this.Sheets.Count()))
+        names.Add("_rels/.rels")
+        parts.Add(XlsxWorkbook.rootRels())
+        names.Add("docProps/core.xml")
+        parts.Add(this.core())
+        names.Add("docProps/app.xml")
+        parts.Add(this.app())
+        names.Add("xl/workbook.xml")
+        parts.Add(this.workbook())
+        names.Add("xl/_rels/workbook.xml.rels")
+        parts.Add(this.workbookRels())
+        names.Add("xl/styles.xml")
+        parts.Add(XlsxWorkbook.styles())
+        for i in 0..this.Sheets.Count() {
+            let s: XlsxSheet = this.Sheets.Get(i)
+            names.Add("xl/worksheets/sheet" + String_FromInt(i + 1) + ".xml")
+            parts.Add(s.Xml())
+        }
+        let out = new List<int>()
+        @c { Amalgame_Xlsx_Zip(names, parts, out); }
+        return out
+    }
+}

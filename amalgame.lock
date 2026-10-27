@@ -47,3 +47,9 @@ name = "service"
 git  = "github.com/amalgame-lang/amalgame-service"
 tag  = "v0.3.0"
 rev  = "10ca1000"
+
+[[package]]
+name = "xlsx"
+git  = "github.com/amalgame-lang/amalgame-formats-xlsx"
+tag  = "v0.1.0"
+rev  = "10ca1000"

@@ -26,6 +26,7 @@ LOCAL=(
   "amalgame-service|v0.3.0"
   "amalgame-datetime|v0.3.0"
   "amalgame-net-http|v0.30.0"
+  "amalgame-formats-xlsx|v0.1.0"
 )
 # name|tag  — from the amc cache
 CACHED=(
