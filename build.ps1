@@ -83,7 +83,10 @@ foreach ($p in $pkgs) {
     # The stamp holds a fingerprint of the package sources: when they
     # change (a re-vendored, modified package), it is precompiled again.
     $hash = Get-SourceHash $dir.FullName
-    if ((Test-Path $stamp) -and ((Get-Content $stamp -Raw).Trim() -eq $hash)) { continue }
+    # An old stamp may be empty (Get-Content then returns $null).
+    $previous = ""
+    if (Test-Path $stamp) { $previous = ([string](Get-Content $stamp -Raw)).Trim() }
+    if ($previous -eq $hash) { continue }
     Remove-Item -Recurse -Force (Join-Path $dir.FullName "build\$plat") -ErrorAction SilentlyContinue
     $log = "build\pkg-$name.log"
     & $amc package add "github.com/amalgame-lang/amalgame-$name@$tag" *> $log
