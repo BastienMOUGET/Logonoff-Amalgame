@@ -50,7 +50,11 @@ for p in "${PKGS[@]}"; do
     dir=$(ls -d "packages/github.com/amalgame-lang/amalgame-$name/${tag}_"* 2>/dev/null | head -1)
     [ -n "$dir" ] || die "packages/ has no amalgame-$name $tag"
     stamp="$dir/build/$PLAT/.logonoff-precompiled"
-    [ -f "$stamp" ] && continue
+    # The stamp holds a fingerprint of the package sources: when they
+    # change (a re-vendored, modified package), it is precompiled again.
+    hash=$( { cat "$dir/amalgame.toml" "$dir"/*.am "$dir"/*.h "$dir"/runtime/*.h 2>/dev/null || true; } | md5sum | cut -c1-32)
+    [ -f "$stamp" ] && [ "$(cat "$stamp")" = "$hash" ] && continue
+    rm -rf "$dir/build/$PLAT"
     # amalgame-tls' ACME facade doesn't compile in this setup; Logonoff
     # only needs its header (net-http's TLS paths), so a failed facade is
     # tolerated — the link step is the real gate.
@@ -61,7 +65,7 @@ for p in "${PKGS[@]}"; do
         warn "$name: facade not precompiled (see build/pkg-$name.log)"
         grep -v "^ *|\|^ *-->\|^\s*$" "build/pkg-$name.log" | head -15 | sed 's/^/      /' >&2
     else
-        mkdir -p "$dir/build/$PLAT" && touch "$stamp"
+        mkdir -p "$dir/build/$PLAT" && echo "$hash" > "$stamp"
     fi
     echo "  precompiled $name $tag"
 done

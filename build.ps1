@@ -56,6 +56,21 @@ $env:AMALGAME_PACKAGES_DIR = (Resolve-Path "packages").Path
 New-Item -ItemType Directory -Force build | Out-Null
 $plat = "windows-x86_64"
 
+# Fingerprint of a package's sources (manifest, .am, headers).
+function Get-SourceHash($pkgDir) {
+    $files = @(Get-ChildItem (Join-Path $pkgDir "*") -File -Include amalgame.toml, *.am, *.h -ErrorAction SilentlyContinue) +
+             @(Get-ChildItem (Join-Path $pkgDir "runtime") -File -Filter *.h -ErrorAction SilentlyContinue)
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    $ms = New-Object System.IO.MemoryStream
+    foreach ($f in ($files | Sort-Object FullName)) {
+        $b = [System.IO.File]::ReadAllBytes($f.FullName)
+        $ms.Write($b, 0, $b.Length)
+    }
+    $h = ($sha.ComputeHash($ms.ToArray()) | ForEach-Object { $_.ToString("x2") }) -join ""
+    $sha.Dispose()
+    return $h
+}
+
 # -- packages (offline, dependency order) ---------------
 $pkgs = @("crypto@v0.8.0", "async@v0.4.1", "tls@v0.3.6", "net-http@v0.30.0", "threading@v0.1.0",
           "database-sqlite@v0.4.0", "datetime@v0.3.0", "service@v0.3.0", "formats-xlsx@v0.1.0")
@@ -65,7 +80,11 @@ foreach ($p in $pkgs) {
     $dir = Get-ChildItem "packages\github.com\amalgame-lang\amalgame-$name" -Directory -Filter "$($tag)_*" -ErrorAction SilentlyContinue | Select-Object -First 1
     if (-not $dir) { Die "packages\ ne contient pas amalgame-$name $tag" }
     $stamp = Join-Path $dir.FullName "build\$plat\.logonoff-precompiled"
-    if (Test-Path $stamp) { continue }
+    # The stamp holds a fingerprint of the package sources: when they
+    # change (a re-vendored, modified package), it is precompiled again.
+    $hash = Get-SourceHash $dir.FullName
+    if ((Test-Path $stamp) -and ((Get-Content $stamp -Raw).Trim() -eq $hash)) { continue }
+    Remove-Item -Recurse -Force (Join-Path $dir.FullName "build\$plat") -ErrorAction SilentlyContinue
     $log = "build\pkg-$name.log"
     & $amc package add "github.com/amalgame-lang/amalgame-$name@$tag" *> $log
     if ($LASTEXITCODE -ne 0) { Die "amc package add $name@$tag (voir $log)" }
@@ -74,7 +93,7 @@ foreach ($p in $pkgs) {
         Warn "$name : facade non precompilee (voir $log)"
     } else {
         New-Item -ItemType Directory -Force (Split-Path $stamp) | Out-Null
-        New-Item -ItemType File -Force $stamp | Out-Null
+        Set-Content -Path $stamp -Value $hash -Encoding ascii
     }
     Write-Host "   precompile $name $tag"
 }
