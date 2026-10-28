@@ -158,6 +158,7 @@ if (Test-Path dist) { Remove-Item -Recurse -Force dist }
 New-Item -ItemType Directory dist | Out-Null
 Copy-Item build\logonoff.exe dist\
 Copy-Item -Recurse www dist\www
+Copy-Item packaging\logonoff.ico dist\
 Copy-Item packaging\install.cmd, packaging\uninstall.cmd dist\
 # A service doesn't see the user's PATH: ship the toolchain DLLs the exe
 # (and those DLLs) import.

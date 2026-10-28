@@ -29,6 +29,9 @@ import Amalgame.Threading
 //   allocations — per-day manual split of time between imputations;
 //                when a day has rows, they replace the computed split
 //                (report, export). project_id 0 = no project.
+//   notifications — per-user queue read by the web app (PWA), which
+//                shows them through the browser: nothing is launched in
+//                the user's session for that (antivirus-friendly).
 //   breaks     — absences the user declared as not worked (lunch,
 //                personal). A declared lunch replaces the lunch-gap
 //                guess.
@@ -98,6 +101,19 @@ public class Store {
             + "id INTEGER PRIMARY KEY, user_id INTEGER NOT NULL REFERENCES users(id), "
             + "start_at INTEGER NOT NULL, end_at INTEGER NOT NULL, kind TEXT NOT NULL)")
         SQLite.Exec(this.Db, "CREATE INDEX IF NOT EXISTS ix_breaks_user_start ON breaks(user_id, start_at)")
+        // One-off migrations, tracked by PRAGMA user_version.
+        // v2: toasts start logonoff.exe in the user's session, which
+        // antivirus products block; the former default ("toast", saved
+        // as soon as the settings form was submitted) becomes "message".
+        let ver: int = this.scalarInt("PRAGMA user_version", new List<string>())
+        if (ver < 2) {
+            SQLite.Exec(this.Db, "UPDATE settings SET value = 'message' WHERE key = 'notify_how' AND value = 'toast'")
+            SQLite.Exec(this.Db, "PRAGMA user_version = 2")
+        }
+        SQLite.Exec(this.Db,
+            "CREATE TABLE IF NOT EXISTS notifications ("
+            + "id INTEGER PRIMARY KEY, user_id INTEGER NOT NULL REFERENCES users(id), at INTEGER NOT NULL, "
+            + "title TEXT NOT NULL, body TEXT NOT NULL, url TEXT NOT NULL DEFAULT '', delivered INTEGER NOT NULL DEFAULT 0)")
         SQLite.Exec(this.Db,
             "CREATE TABLE IF NOT EXISTS allocations ("
             + "user_id INTEGER NOT NULL REFERENCES users(id), day TEXT NOT NULL, "
@@ -645,6 +661,33 @@ public class Store {
         let rows: List<List<string>> = this.q("SELECT key, value FROM settings WHERE scope = ? ORDER BY key", Store.P1(scope))
         Threading.MutexUnlock(this.Mu)
         return rows
+    }
+
+    // ── notification queue (web app) ──────────────────
+
+    public void AddNotification(userId: int, at: int, title: string, body: string, url: string) {
+        Threading.MutexLock(this.Mu)
+        this.x("INSERT INTO notifications (user_id, at, title, body, url) VALUES (?, ?, ?, ?, ?)",
+            Store.P5(Store.I(userId), Store.I(at), title, body, url))
+        // Keep a week of history at most.
+        this.x("DELETE FROM notifications WHERE at < ?", Store.P1(Store.I(at - 7 * 86400)))
+        Threading.MutexUnlock(this.Mu)
+    }
+
+    // [id, at, title, body, url] not yet delivered, newer than `since`.
+    public List<List<string>> PendingNotifications(userId: int, since: int) {
+        Threading.MutexLock(this.Mu)
+        let rows: List<List<string>> = this.q(
+            "SELECT id, at, title, body, url FROM notifications WHERE user_id = ? AND delivered = 0 AND at >= ? ORDER BY id",
+            Store.P2(Store.I(userId), Store.I(since)))
+        Threading.MutexUnlock(this.Mu)
+        return rows
+    }
+
+    public void AckNotifications(userId: int, upTo: int) {
+        Threading.MutexLock(this.Mu)
+        this.x("UPDATE notifications SET delivered = 1 WHERE user_id = ? AND id <= ?", Store.P2(Store.I(userId), Store.I(upTo)))
+        Threading.MutexUnlock(this.Mu)
     }
 
     // ── notifications ─────────────────────────────────

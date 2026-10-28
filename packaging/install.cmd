@@ -66,7 +66,13 @@ sc start Logonoff
 if errorlevel 1 echo [ATTENTION] Le service na pas demarre : voir ci-dessus et lObservateur devenements.
 
 rem Raccourci du menu Demarrer (pour tous les utilisateurs) vers linterface.
-powershell -NoProfile -ExecutionPolicy Bypass -Command "$s=(New-Object -ComObject WScript.Shell).CreateShortcut(\"$env:ProgramData\Microsoft\Windows\Start Menu\Programs\Logonoff.lnk\"); $s.TargetPath=\"%DEST%\logonoff.exe\"; $s.Arguments=\"--open\"; $s.IconLocation=\"%DEST%\logonoff.exe,0\"; $s.Description=\"Ouvrir Logonoff\"; $s.Save()"
+(
+  echo [InternetShortcut]
+  echo URL=http://127.0.0.1:8765/
+  echo IconFile=%DEST%\logonoff.ico
+  echo IconIndex=0
+) > "%ProgramData%\Microsoft\Windows\Start Menu\Programs\Logonoff.url"
+del "%ProgramData%\Microsoft\Windows\Start Menu\Programs\Logonoff.lnk" >nul 2>&1
 
 echo.
 sc query Logonoff | findstr /i "STATE ETAT"

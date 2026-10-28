@@ -131,6 +131,7 @@ log "Stage dist/"
 rm -rf dist && mkdir -p dist
 cp "build/$EXE" dist/
 cp -r www dist/www
+cp packaging/logonoff.ico dist/
 if [ "$WIN" = 1 ]; then
     cp packaging/install.cmd packaging/uninstall.cmd dist/
     # A service doesn't see the MSYS2 PATH: ship the MinGW DLLs next to the exe.

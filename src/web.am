@@ -287,6 +287,11 @@ public class WebServer {
             Service.InjectEvent(WebServer.JStr(body, "kind"), 1)
             return WebServer.Ok()
         }
+        if (a == "notifications") {
+            if (get) { return this.notifications(c, now) }
+            this.Store.AckNotifications(c.UserId, WebServer.JInt(body, "upTo"))
+            return WebServer.Ok()
+        }
         if (a == "test-notify" && !get) {
             let prefs: Prefs = Prefs.Load(this.Store, c.UserId)
             this.Tracker.Notify(c.UserId, "Logonoff", "Notification de test. Cliquez pour ouvrir Logonoff.", prefs.NotifyHow, this.Tracker.Url("#today"))
@@ -328,6 +333,24 @@ public class WebServer {
     }
 
     // ── endpoints ─────────────────────────────────────
+
+    // Notifications waiting for the web app (last 2 hours only: an app
+    // opened in the evening must not replay the whole day).
+    public HttpResponse notifications(c: Caller, now: int) {
+        let rows: List<List<string>> = this.Store.PendingNotifications(c.UserId, now - 7200)
+        let items = new List<string>()
+        for i in 0..rows.Count() {
+            let r: List<string> = rows.Get(i)
+            let f = new List<string>()
+            f.Add(Js.F("id", r.Get(0)))
+            f.Add(Js.F("at", r.Get(1)))
+            f.Add(Js.F("title", Js.S(r.Get(2))))
+            f.Add(Js.F("body", Js.S(r.Get(3))))
+            f.Add(Js.F("url", Js.S(r.Get(4))))
+            items.Add(Js.Obj(f))
+        }
+        return WebServer.JsonOk(Js.Arr(items))
+    }
 
     public HttpResponse me(c: Caller, now: int) {
         let u: List<string> = this.Store.User(c.UserId)
@@ -1202,7 +1225,7 @@ public class WebServer {
         }
         if (body.Has("notifyHow")) {
             let nh: string = WebServer.JStr(body, "notifyHow")
-            if (nh != "toast" && nh != "message") { return WebServer.Err(400, "type de notification inconnu") }
+            if (nh != "toast" && nh != "message" && nh != "app") { return WebServer.Err(400, "type de notification inconnu") }
             this.Store.SetSetting(scope, "notify_how", nh)
         }
         if (body.Has("notifyAhead")) {

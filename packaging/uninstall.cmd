@@ -12,6 +12,7 @@ sc stop Logonoff >nul 2>&1
 timeout /t 3 /nobreak >nul
 sc delete Logonoff
 del "%ProgramData%\Microsoft\Windows\Start Menu\Programs\Logonoff.lnk" >nul 2>&1
+del "%ProgramData%\Microsoft\Windows\Start Menu\Programs\Logonoff.url" >nul 2>&1
 cd /d "%TEMP%"
 rmdir /s /q "%ProgramFiles%\Logonoff"
 echo.

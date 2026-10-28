@@ -89,6 +89,18 @@ l'ancienne version C# (service + notifier WinForms + CSV hebdomadaires).
   déjeuner) et que la plage n'est pas passée, l'estimation ajoute la durée
   moyenne des N derniers repas (10 par défaut). Cette durée n'est jamais
   inférieure à la pause minimale réglée.
+- **Notifications sans lancer de programme.** Les antivirus d'entreprise
+  (Trend Apex One…) bloquent un exécutable inconnu lancé dans la session.
+  Le service ne lance donc rien par défaut :
+  - **boîte de message Windows** (`WTSSendMessage`), affichée par Windows
+    lui-même ;
+  - **notifications de l'application** (PWA ou onglet ouvert, même en
+    arrière-plan), affichées par le navigateur. Le service les met en
+    file, l'application les récupère, et un clic ouvre la bonne page.
+
+  Le toast Windows (`logonoff.exe --notify`) reste disponible en option.
+  Le menu Démarrer pointe vers l'adresse web (`Logonoff.url`), pas vers
+  l'exécutable.
 - **Fin de journée.** Le service prévient (toast Windows ou boîte de
   message) quand l'objectif est atteint, avec un préavis réglable. Deux
   modes : objectif du jour, ou cumul de la semaine à date (comme l'ancien

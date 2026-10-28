@@ -599,7 +599,10 @@ views.settings = async (root) => {
   const lunchAvg = el("input", { type: "number", min: "1", max: "60", value: s.lunchAvgDays });
   const mode = el("select", {}, el("option", { value: "week" }, "Objectif de la semaine (à date)"), el("option", { value: "day" }, "Objectif du jour"), el("option", { value: "off" }, "Désactivées"));
   mode.value = s.notifyMode;
-  const how = el("select", {}, el("option", { value: "toast" }, "Notification Windows"), el("option", { value: "message" }, "Boîte de message"));
+  const how = el("select", {},
+    el("option", { value: "message" }, "Boîte de message Windows + application"),
+    el("option", { value: "app" }, "Application seulement"),
+    el("option", { value: "toast" }, "Toast Windows (lance logonoff.exe : peut être bloqué par l'antivirus)"));
   how.value = s.notifyHow;
   const ahead = el("input", { type: "number", min: "0", max: "240", value: s.notifyAhead });
   const absMin = el("input", { type: "number", min: "1", max: "480", value: s.absenceMin });
@@ -653,7 +656,9 @@ views.settings = async (root) => {
       field("Préavis (min, 0 = aucun)", ahead)),
     el("div", { class: "row" },
       el("button", { class: "primary", onclick: save }, "Enregistrer"),
-      el("button", { onclick: () => act(() => api("test-notify", {}), "Notification envoyée") }, "Tester la notification")));
+      el("button", { onclick: () => act(() => api("test-notify", {}), "Notification envoyée") }, "Tester la notification"),
+      notifPermissionButton()),
+    el("p", { class: "hint" }, "Les notifications s'affichent aussi dans l'application (ou l'onglet Logonoff) tant qu'elle est ouverte, même en arrière-plan. Autorisez-les une fois avec le bouton ci-dessus."));
 
   const exHeader = el("input", { class: "wide", value: s.exportHeader, maxlength: "500" });
   const exLine = el("input", { class: "wide", value: s.exportLine, maxlength: "500" });
@@ -698,6 +703,49 @@ views.settings = async (root) => {
 
   root.append(el("h1", {}, "Paramètres"), personal, exportCard, network, machine, install);
 };
+
+// ── notifications (file du service, affichées par le navigateur) ──
+//
+// Le service met chaque notification en file ; l'application la récupère
+// et l'affiche via le navigateur : aucun programme n'est lancé dans la
+// session (les antivirus bloquent logonoff.exe lancé par le service).
+
+function notifPermissionButton() {
+  if (!("Notification" in window)) return null;
+  const label = { granted: "Notifications du navigateur : autorisées", denied: "Notifications du navigateur : refusées (à changer dans le navigateur)", default: "Autoriser les notifications du navigateur" };
+  const b = el("button", { disabled: Notification.permission !== "default" }, label[Notification.permission]);
+  b.addEventListener("click", async () => {
+    const r = await Notification.requestPermission();
+    b.textContent = label[r];
+    b.disabled = r !== "default";
+  });
+  return b;
+}
+
+async function showNotification(n) {
+  const target = "/" + (n.url ? n.url.replace(/^https?:\/\/[^/]+\//, "") : "#today");
+  if ("Notification" in window && Notification.permission === "granted") {
+    const opts = { body: n.body, icon: "/icon-192.png", badge: "/favicon.png", tag: "logonoff-" + n.id, data: { url: target } };
+    const reg = "serviceWorker" in navigator ? await navigator.serviceWorker.getRegistration() : null;
+    if (reg) { await reg.showNotification(n.title, opts); return; }
+    const notif = new Notification(n.title, opts);
+    notif.onclick = () => { window.focus(); location.href = target; notif.close(); };
+    return;
+  }
+  toast(n.title + " — " + n.body);
+}
+
+async function pollNotifications() {
+  if (!state.me) return;
+  try {
+    const list = await api("notifications");
+    if (!list.length) return;
+    for (const n of list) await showNotification(n);
+    await api("notifications", { upTo: Math.max(...list.map((n) => n.id)) });
+  } catch (_) { /* service indisponible : on réessaiera */ }
+}
+setInterval(pollNotifications, 20000);
+setTimeout(pollNotifications, 3000);
 
 // ── routeur ───────────────────────────────────────────
 

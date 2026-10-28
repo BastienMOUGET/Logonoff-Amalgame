@@ -135,7 +135,7 @@ public class Prefs {
     public LunchFrom:   int         // lunch window, minutes after midnight
     public LunchTo:     int
     public NotifyMode:  string      // "week" | "day" | "off"
-    public NotifyHow:   string      // "toast" | "message"
+    public NotifyHow:   string      // "message" | "app" | "toast"
     public NotifyAhead: int         // minutes of advance warning, 0 = none
     public AbsenceMin:  int         // gaps at least this long (minutes) are "to qualify"
     public AskOnReturn: bool        // notify on return from such an absence
@@ -151,7 +151,7 @@ public class Prefs {
         this.LunchFrom   = 660
         this.LunchTo     = 900
         this.NotifyMode  = "week"
-        this.NotifyHow   = "toast"
+        this.NotifyHow   = "message"
         this.NotifyAhead = 10
         this.AbsenceMin  = 15
         this.AskOnReturn = true
@@ -184,7 +184,7 @@ public class Prefs {
         p.LunchFrom   = String_ToInt(store.Setting(scope, "lunch_from", "660"))
         p.LunchTo     = String_ToInt(store.Setting(scope, "lunch_to", "900"))
         p.NotifyMode  = store.Setting(scope, "notify_mode", "week")
-        p.NotifyHow   = store.Setting(scope, "notify_how", "toast")
+        p.NotifyHow   = store.Setting(scope, "notify_how", "message")
         p.NotifyAhead = String_ToInt(store.Setting(scope, "notify_ahead", "10"))
         p.AbsenceMin  = String_ToInt(store.Setting(scope, "absence_min", "15"))
         p.AskOnReturn = store.Setting(scope, "ask_on_return", "1") == "1"

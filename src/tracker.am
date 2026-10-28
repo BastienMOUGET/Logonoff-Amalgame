@@ -278,11 +278,19 @@ public class Tracker {
         }
     }
 
-    // Deliver to every session of the user. From the service: a toast
-    // through a short-lived `logonoff --notify` started in the
-    // session, or a message box; in console / dev mode the process
-    // already runs on the user's desktop.
+    // Deliver a notification. It is always queued for the web app (the
+    // PWA shows it through the browser — nothing launched in the user's
+    // session). Then, per the user's choice:
+    //   "message" (default): a Windows message box (WTSSendMessage —
+    //             displayed by Windows itself, no program started);
+    //   "app":     the web app only;
+    //   "toast":   a tray toast through `logonoff --notify` started in
+    //             the session — antivirus products (Trend Apex One…)
+    //             may block that unknown program each time.
+    // In console / dev mode the process already runs on the desktop.
     public void Notify(userId: int, title: string, message: string, how: string, url: string) {
+        this.Store.AddNotification(userId, Tracker.Now(), title, message, url)
+        if (how == "app") { return }
         if (this.Dev || !this.UnderScm) {
             Platform.ShowBalloon(title, message, 8, url)
             return
@@ -292,7 +300,7 @@ public class Tracker {
             let s: int = sessions.Get(i)
             if (this.UserForSession(s, Tracker.Now()) != userId) { continue }
             var sent: bool = false
-            if (how != "message") {
+            if (how == "toast") {
                 let cmd: string = "\"" + this.ExePath + "\" --notify \"" + Tracker.Unquote(title) + "\" \"" + Tracker.Unquote(message) + "\" \"" + Tracker.Unquote(url) + "\""
                 sent = Service.LaunchInSession(s, cmd) > 0
             }

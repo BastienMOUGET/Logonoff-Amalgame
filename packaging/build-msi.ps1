@@ -11,7 +11,8 @@
 #     service, or one created by install.cmd), then installs the
 #     service (LocalSystem, automatic start, "--service") and starts it
 #     (restart-on-failure is set by the service itself at start-up);
-#   - Start menu shortcut "Logonoff" (logonoff.exe --open);
+#   - Start menu entry "Logonoff": an Internet shortcut to the web UI
+#     (no program launched in the user's session: antivirus-friendly);
 #   - major upgrade: a newer .msi replaces the installed one;
 #   - uninstall stops and removes the service and the files.
 #     C:\ProgramData\Logonoff (the database) is never touched.
@@ -262,6 +263,7 @@ $schemas = @(
     "CREATE TABLE ``Shortcut`` (``Shortcut`` CHAR(72) NOT NULL, ``Directory_`` CHAR(72) NOT NULL, ``Name`` CHAR(128) NOT NULL LOCALIZABLE, ``Component_`` CHAR(72) NOT NULL, ``Target`` CHAR(72) NOT NULL, ``Arguments`` CHAR(255), ``Description`` CHAR(255) LOCALIZABLE, ``Hotkey`` SHORT, ``Icon_`` CHAR(72), ``IconIndex`` SHORT, ``ShowCmd`` SHORT, ``WkDir`` CHAR(72) PRIMARY KEY ``Shortcut``)",
     "CREATE TABLE ``Icon`` (``Name`` CHAR(72) NOT NULL, ``Data`` OBJECT NOT NULL PRIMARY KEY ``Name``)",
     "CREATE TABLE ``Upgrade`` (``UpgradeCode`` CHAR(38) NOT NULL, ``VersionMin`` CHAR(20), ``VersionMax`` CHAR(20), ``Language`` CHAR(255), ``Attributes`` LONG NOT NULL, ``Remove`` CHAR(255), ``ActionProperty`` CHAR(72) NOT NULL PRIMARY KEY ``UpgradeCode``, ``VersionMin``, ``VersionMax``, ``Language``, ``Attributes``)",
+    "CREATE TABLE ``IniFile`` (``IniFile`` CHAR(72) NOT NULL, ``FileName`` CHAR(255) NOT NULL LOCALIZABLE, ``DirProperty`` CHAR(72), ``Section`` CHAR(96) NOT NULL LOCALIZABLE, ``Key`` CHAR(128) NOT NULL LOCALIZABLE, ``Value`` CHAR(255) NOT NULL LOCALIZABLE, ``Action`` SHORT NOT NULL, ``Component_`` CHAR(72) NOT NULL PRIMARY KEY ``IniFile``)",
     "CREATE TABLE ``ServiceInstall`` (``ServiceInstall`` CHAR(72) NOT NULL, ``Name`` CHAR(255) NOT NULL, ``DisplayName`` CHAR(255) LOCALIZABLE, ``ServiceType`` LONG NOT NULL, ``StartType`` LONG NOT NULL, ``ErrorControl`` LONG NOT NULL, ``LoadOrderGroup`` CHAR(255), ``Dependencies`` CHAR(255), ``StartName`` CHAR(255), ``Password`` CHAR(255), ``Arguments`` CHAR(255), ``Component_`` CHAR(72) NOT NULL, ``Description`` CHAR(255) LOCALIZABLE PRIMARY KEY ``ServiceInstall``)",
     "CREATE TABLE ``ServiceControl`` (``ServiceControl`` CHAR(72) NOT NULL, ``Name`` CHAR(255) NOT NULL LOCALIZABLE, ``Event`` SHORT NOT NULL, ``Arguments`` CHAR(255) LOCALIZABLE, ``Wait`` SHORT, ``Component_`` CHAR(72) NOT NULL PRIMARY KEY ``ServiceControl``)"
 )
@@ -356,9 +358,19 @@ Invoke-MSI $iconView "Execute" @($iconRecord)
 Invoke-MSI $iconView "Close" @()
 [void][System.Runtime.InteropServices.Marshal]::ReleaseComObject($iconRecord)
 [void][System.Runtime.InteropServices.Marshal]::ReleaseComObject($iconView)
-Insert-Row "Shortcut" @("Shortcut", "Directory_", "Name", "Component_", "Target", "Arguments", "Description", "Hotkey", "Icon_", "IconIndex", "ShowCmd", "WkDir") @(
-    "S_Logonoff", "ProgramMenuFolder", "Logonoff", $exe.ComponentId, "[#$($exe.FileKey)]", "--open",
-    "Ouvrir Logonoff", $null, "logonoff.ico", [int]0, [int]1, "INSTALLLOCATION")
+# Start menu entry = an Internet shortcut (Logonoff.url) to the web UI,
+# not a shortcut to logonoff.exe: antivirus products (Trend Apex One)
+# block an unknown program launched in the user's session, while the
+# browser is trusted. Written through the IniFile table.
+$ini = @(
+    @("Ini_Url",       "URL",       "http://127.0.0.1:8765/"),
+    @("Ini_IconFile",  "IconFile",  "[INSTALLLOCATION]logonoff.ico"),
+    @("Ini_IconIndex", "IconIndex", "0")
+)
+foreach ($r in $ini) {
+    Insert-Row "IniFile" @("IniFile", "FileName", "DirProperty", "Section", "Key", "Value", "Action", "Component_") @(
+        $r[0], "Logonoff.url", "ProgramMenuFolder", "InternetShortcut", $r[1], $r[2], [int]0, $exe.ComponentId)
+}
 
 # -- Sequences ------------------------------------------------------------
 # RemoveExistingProducts right after InstallValidate: the old version
@@ -378,9 +390,11 @@ $execSeq = @(
     @("StopServices",            $null, 1900),
     @("DeleteServices",          $null, 2000),
     @("RemoveShortcuts",         $null, 3200),
+    @("RemoveIniValues",         $null, 3300),
     @("RemoveFiles",             $null, 3500),
     @("InstallFiles",            $null, 4000),
     @("CreateShortcuts",         $null, 4500),
+    @("WriteIniValues",          $null, 5100),
     @("InstallServices",         $null, 5800),
     @("StartServices",           $null, 5900),
     @("RegisterUser",            $null, 6000),
